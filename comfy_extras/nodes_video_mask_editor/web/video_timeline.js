@@ -95,6 +95,25 @@ function button(label, callback) {
     return element;
 }
 
+function nodeExecutionId(node) {
+    const graph = node.graph;
+    const rootGraph = graph?.rootGraph ?? app.rootGraph;
+    if (!graph || graph === rootGraph || graph.isRootGraph) return String(node.id);
+
+    function findPath(target, current) {
+        for (const candidate of current.nodes ?? current._nodes ?? []) {
+            if (!candidate.isSubgraphNode?.() || !candidate.subgraph) continue;
+            if (candidate.subgraph === target) return String(candidate.id);
+            const childPath = findPath(target, candidate.subgraph);
+            if (childPath) return `${candidate.id}:${childPath}`;
+        }
+        return null;
+    }
+
+    const parentPath = findPath(graph, rootGraph);
+    return parentPath ? `${parentPath}:${node.id}` : String(node.id);
+}
+
 function parseValue(widget, source) {
     let data = {};
     try { data = JSON.parse(widget.value || "{}"); } catch {}
@@ -177,7 +196,7 @@ async function openTimeline(node) {
     const state = node.videoTimelineState;
     if (!state.source) {
         state.reopen = true;
-        await app.queuePrompt(0, 1, [node.id]);
+        await app.queuePrompt(0, 1, [nodeExecutionId(node)]);
         return;
     }
     const widget = node.widgets?.find((item) => item.name === "timeline_data");
