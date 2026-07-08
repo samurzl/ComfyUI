@@ -192,6 +192,7 @@ class VideoTimeline(io.ComfyNode):
             description="Select a video range for regeneration or paint a frame-by-frame inpainting mask. Outputs an LTX-ready 8n+1 frame window with surrounding context.",
             search_aliases=["video edit timeline", "regenerate video section", "paint video mask"],
             has_intermediate_output=True,
+            is_output_node=True,
             inputs=[
                 io.Video.Input("video"),
                 io.String.Input("timeline_data", default="", socketless=True, extra_dict={"hidden": True}),
