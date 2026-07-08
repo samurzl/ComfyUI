@@ -2,6 +2,7 @@ import folder_paths
 import comfy.utils
 import comfy.model_management
 import torch
+import torchaudio
 
 from comfy_api.latest import ComfyExtension, io
 from comfy_extras.nodes_audio import VAEEncodeAudio
@@ -88,6 +89,71 @@ class LTXVAudioVAEDecode(io.ComfyNode):
                 "sample_rate": int(output_audio_sample_rate),
             }
         )
+
+
+class LTXVAudioToAudioInplace(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="LTXVAudioToAudioInplace",
+            display_name="LTXV Audio to Audio (Inplace)",
+            category="model/conditioning/ltxv",
+            description="Encodes audio into the beginning of an audio latent and masks it out of "
+                        "sampling, so a continuation keeps the original soundtrack. The audio "
+                        "counterpart of LTXVImgToVideoInplace.",
+            inputs=[
+                io.Vae.Input(
+                    id="audio_vae",
+                    display_name="Audio VAE",
+                    tooltip="The Audio VAE model to use for encoding.",
+                ),
+                io.Latent.Input("latent", tooltip="Audio latent to condition, eg. from LTXVEmptyLatentAudio."),
+                io.Audio.Input(
+                    "audio",
+                    optional=True,
+                    tooltip="Audio to condition the latent on. When unconnected (eg. the source "
+                            "video has no audio track) the latent is passed through unchanged.",
+                ),
+                io.Float.Input("strength", default=1.0, min=0.0, max=1.0),
+                io.Boolean.Input("bypass", default=False, tooltip="Bypass the conditioning."),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, audio_vae, latent, audio=None, strength=1.0, bypass=False) -> io.NodeOutput:
+        if bypass or audio is None:
+            return io.NodeOutput(latent)
+
+        sample_rate = audio["sample_rate"]
+        vae_sample_rate = getattr(audio_vae, "audio_sample_rate", 44100)
+        if vae_sample_rate != sample_rate:
+            waveform = torchaudio.functional.resample(audio["waveform"], sample_rate, vae_sample_rate)
+        else:
+            waveform = audio["waveform"]
+
+        t = audio_vae.encode(waveform.movedim(1, -1))
+        samples = latent["samples"].clone()
+        cond_length = min(t.shape[2], samples.shape[2])
+        samples[:, :, :cond_length] = t[:, :, :cond_length]
+
+        noise_mask = latent.get("noise_mask", None)
+        if noise_mask is None:
+            noise_mask = torch.ones(
+                (samples.shape[0], 1, samples.shape[2], 1),
+                dtype=torch.float32,
+                device=samples.device,
+            )
+        else:
+            noise_mask = noise_mask.clone()
+        noise_mask[:, :, :cond_length] = 1.0 - strength
+
+        out = latent.copy()
+        out["samples"] = samples
+        out["noise_mask"] = noise_mask
+        return io.NodeOutput(out)
 
 
 class LTXVEmptyLatentAudio(io.ComfyNode):
@@ -210,6 +276,7 @@ class LTXVAudioExtension(ComfyExtension):
             LTXVAudioVAELoader,
             LTXVAudioVAEEncode,
             LTXVAudioVAEDecode,
+            LTXVAudioToAudioInplace,
             LTXVEmptyLatentAudio,
             LTXAVTextEncoderLoader,
         ]
