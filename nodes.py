@@ -2492,6 +2492,7 @@ async def init_builtin_extra_nodes():
         "nodes_rtdetr.py",
         "nodes_frame_interpolation.py",
         "nodes_sam3.py",
+        "nodes_video_mask_editor",
         "nodes_scail.py",
         "nodes_void.py",
         "nodes_wandancer.py",
