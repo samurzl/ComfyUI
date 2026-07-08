@@ -13,25 +13,32 @@ function addStyles() {
         .video-timeline-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 9px 0; }
         .video-timeline-editor button, .video-timeline-editor input { color: inherit; background: #333; border: 1px solid #666; border-radius: 5px; padding: 6px 9px; }
         .video-timeline-editor button.active { background: #315b88; border-color: #72b4fa; }
-        .video-timeline-stage { position: relative; width: fit-content; max-width: 100%; margin: 10px auto; line-height: 0; background: #000; }
-        .video-timeline-stage canvas { display: block; max-width: 90vw; max-height: 55vh; width: auto; height: auto; }
-        .video-timeline-stage canvas + canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
-        .video-timeline-lanes { position: relative; height: 114px; margin: 10px 0; overflow: hidden; border: 1px solid #555; border-radius: 6px; background: #111; touch-action: none; }
+        .video-timeline-stage { position: relative; width: fit-content; max-width: 100%; margin: 10px auto; line-height: 0; overflow: hidden; background: #000; }
+        .video-timeline-stage video { display: block; max-width: 90vw; max-height: 52vh; width: auto; height: auto; }
+        .video-timeline-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: none; }
+        .video-timeline-brush-cursor { position: absolute; display: none; z-index: 2; border: 2px solid white; border-radius: 50%; pointer-events: none; box-sizing: border-box; transform: translate(-50%, -50%); box-shadow: 0 0 0 1px #000, inset 0 0 0 1px #000; }
+        .video-timeline-brush-cursor.erase { border-color: #ff9d9d; }
+        .video-timeline-lanes { position: relative; height: 138px; margin: 10px 0; overflow: hidden; border: 1px solid #555; border-radius: 6px; background: #111; touch-action: none; user-select: none; }
         .video-timeline-lane { position: absolute; left: 72px; right: 0; }
         .video-timeline-lane canvas { width: 100%; height: 100%; display: block; }
-        .video-timeline-video { top: 0; height: 68px; }
-        .video-timeline-audio { top: 69px; height: 44px; border-top: 1px solid #444; }
+        .video-timeline-ruler { top: 0; height: 24px; cursor: ew-resize; background: #181818; border-bottom: 1px solid #444; }
+        .video-timeline-video { top: 25px; height: 68px; cursor: crosshair; }
+        .video-timeline-audio { top: 94px; height: 43px; border-top: 1px solid #444; cursor: ew-resize; }
         .video-timeline-label { position: absolute; left: 0; width: 72px; padding: 6px 8px; color: #aaa; font-size: 11px; box-sizing: border-box; }
-        .video-timeline-label.audio { top: 69px; }
-        .video-timeline-selection { position: absolute; top: 0; bottom: 0; border: 2px solid #69b7ff; background: rgba(58,136,205,.12); box-shadow: 0 0 0 2000px rgba(0,0,0,.45); cursor: grab; box-sizing: border-box; }
-        .video-timeline-selection::before, .video-timeline-selection::after { content: ""; position: absolute; top: -2px; bottom: -2px; width: 9px; background: #69b7ff; cursor: ew-resize; }
-        .video-timeline-selection::before { left: -5px; } .video-timeline-selection::after { right: -5px; }
-        .video-timeline-context { position: absolute; top: 0; bottom: 0; border: 1px dashed #70d18a; pointer-events: none; box-sizing: border-box; }
+        .video-timeline-label.video { top: 25px; } .video-timeline-label.audio { top: 94px; }
+        .video-timeline-selection { position: absolute; top: 25px; height: 68px; border: 2px solid #69b7ff; background: rgba(58,136,205,.18); cursor: grab; box-sizing: border-box; }
+        .video-timeline-handle { position: absolute; top: -2px; bottom: -46px; width: 13px; border: 1px solid #b9dcff; background: #4598df; cursor: ew-resize; box-sizing: border-box; touch-action: none; }
+        .video-timeline-handle.start { left: -7px; } .video-timeline-handle.end { right: -7px; }
+        .video-timeline-handle-label { position: absolute; top: 3px; padding: 2px 4px; border-radius: 3px; color: white; background: #1b5f98; font: 10px/1.2 sans-serif; pointer-events: none; white-space: nowrap; }
+        .video-timeline-handle.start .video-timeline-handle-label { left: 12px; } .video-timeline-handle.end .video-timeline-handle-label { right: 12px; }
+        .video-timeline-context { position: absolute; top: 24px; bottom: 0; border: 1px dashed #70d18a; pointer-events: none; box-sizing: border-box; }
         .video-timeline-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #ffcf4a; pointer-events: none; }
+        .video-timeline-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent; border-top-color: #ffcf4a; }
         .video-timeline-spacer { flex: 1; }
         .video-timeline-hint { color: #bbb; font-size: 12px; }
         .video-timeline-time { min-width: 220px; text-align: center; font-variant-numeric: tabular-nums; }
         .video-timeline-context-input { width: 70px; }
+        .video-timeline-range-readout { color: #cfe8ff; font-variant-numeric: tabular-nums; }
     `;
     document.head.appendChild(style);
 }
@@ -219,7 +226,7 @@ async function openTimeline(node) {
     title.style.fontWeight = "600";
     const hint = document.createElement("div");
     hint.className = "video-timeline-hint";
-    hint.textContent = "Select a range to regenerate, or switch to Inpaint and paint only the pixels that should change. The audio lane is always preserved.";
+    hint.textContent = "Drag the ruler or audio lane to scrub. Drag across the video thumbnails to select a range, then choose Regenerate or Inpaint. Output stays full-length and keeps the original audio.";
     editor.append(title, hint);
 
     const modes = document.createElement("div");
@@ -227,15 +234,16 @@ async function openTimeline(node) {
     const regenerate = button("Regenerate range", () => setMode("regenerate"));
     const inpaint = button("Inpaint mask", () => setMode("inpaint"));
     modes.append(regenerate, inpaint);
-    editor.append(modes);
 
     const stage = document.createElement("div");
     stage.className = "video-timeline-stage";
-    const frameCanvas = makeCanvas(source.width, source.height);
+    video.width = source.width;
+    video.height = source.height;
     const overlayCanvas = makeCanvas(source.width, source.height);
-    stage.append(frameCanvas, overlayCanvas);
+    const brushCursor = document.createElement("div");
+    brushCursor.className = "video-timeline-brush-cursor";
+    stage.append(video, overlayCanvas, brushCursor);
     editor.append(stage);
-    const frameContext = frameCanvas.getContext("2d");
     const overlayContext = overlayCanvas.getContext("2d");
     const scratch = makeCanvas(source.width, source.height);
     const scratchContext = scratch.getContext("2d");
@@ -252,19 +260,22 @@ async function openTimeline(node) {
     size.value = String(Math.max(8, Math.round(Math.min(source.width, source.height) / 40)));
     const sizeLabel = document.createElement("span");
     sizeLabel.textContent = `Size ${size.value}`;
-    size.oninput = () => sizeLabel.textContent = `Size ${size.value}`;
+    size.oninput = () => {
+        sizeLabel.textContent = `Size ${size.value}`;
+        updateBrushCursor();
+    };
     const clearFrame = button("Clear frame", () => {
         state.masks.delete(frame);
         state.masksDirty = true;
         renderOverlay();
     });
     paintTools.append(brush, erase, sizeLabel, size, clearFrame);
-    editor.append(paintTools);
 
     function setPaintTool(next) {
         paintTool = next;
         brush.classList.toggle("active", next === "brush");
         erase.classList.toggle("active", next === "erase");
+        brushCursor.classList.toggle("erase", next === "erase");
     }
 
     function setMode(next) {
@@ -273,14 +284,21 @@ async function openTimeline(node) {
         inpaint.classList.toggle("active", next === "inpaint");
         paintTools.style.display = next === "inpaint" ? "flex" : "none";
         overlayCanvas.style.pointerEvents = next === "inpaint" ? "auto" : "none";
+        if (next === "inpaint" && (frame < settings.selection_start || frame >= settings.selection_end)) showFrame(settings.selection_start);
+        if (next !== "inpaint") brushCursor.style.display = "none";
         renderOverlay();
     }
     setPaintTool("brush");
 
+    settings.selection_start = Math.max(0, Math.min(source.frame_count - 1, Math.round(settings.selection_start)));
+    settings.selection_end = Math.max(settings.selection_start + 1, Math.min(source.frame_count, Math.round(settings.selection_end)));
     let frame = settings.selection_start;
+    let requestedFrame = frame;
+    let seeking = false;
+    let closed = false;
     let drawing = false;
     let lastPoint = null;
-    let renderId = 0;
+    let cursorPoint = null;
 
     function currentMask(create = false) {
         let canvas = state.masks.get(frame);
@@ -308,14 +326,25 @@ async function openTimeline(node) {
         scratchContext.globalCompositeOperation = "source-over";
     }
 
-    async function showFrame(nextFrame, seek = true) {
+    async function seekRequestedFrame() {
+        if (seeking || closed) return;
+        seeking = true;
+        while (!closed) {
+            const target = requestedFrame;
+            await seekVideo(video, (target + 0.5) / source.fps);
+            renderOverlay();
+            if (target === requestedFrame) break;
+        }
+        seeking = false;
+    }
+
+    function showFrame(nextFrame) {
+        video.pause();
         frame = Math.max(0, Math.min(source.frame_count - 1, nextFrame));
-        const id = ++renderId;
-        if (seek) await seekVideo(video, (frame + 0.5) / source.fps);
-        if (id !== renderId) return;
-        frameContext.drawImage(video, 0, 0, source.width, source.height);
+        requestedFrame = frame;
         renderOverlay();
         updateTimeline();
+        return seekRequestedFrame();
     }
 
     function point(event) {
@@ -323,36 +352,77 @@ async function openTimeline(node) {
         return { x: (event.clientX - rect.left) * source.width / rect.width, y: (event.clientY - rect.top) * source.height / rect.height };
     }
 
-    function draw(event) {
-        if (frame < settings.selection_start || frame >= settings.selection_end) return;
+    function updateBrushCursor(event) {
+        if (event) cursorPoint = { x: event.clientX, y: event.clientY };
+        const inRange = frame >= settings.selection_start && frame < settings.selection_end;
+        if (!cursorPoint || settings.mode !== "inpaint" || !inRange) {
+            brushCursor.style.display = "none";
+            return;
+        }
+        const rect = overlayCanvas.getBoundingClientRect();
+        const diameter = Number(size.value) * rect.width / source.width;
+        brushCursor.style.display = "block";
+        brushCursor.style.left = `${cursorPoint.x - rect.left}px`;
+        brushCursor.style.top = `${cursorPoint.y - rect.top}px`;
+        brushCursor.style.width = `${diameter}px`;
+        brushCursor.style.height = `${diameter}px`;
+    }
+
+    function drawPoint(event) {
         const next = point(event);
         const context = currentMask(true).getContext("2d");
         context.save();
         context.globalCompositeOperation = paintTool === "erase" ? "destination-out" : "source-over";
+        context.fillStyle = "white";
         context.strokeStyle = "white";
         context.lineCap = "round";
         context.lineJoin = "round";
         context.lineWidth = Number(size.value);
-        context.beginPath();
-        context.moveTo(lastPoint?.x ?? next.x, lastPoint?.y ?? next.y);
-        context.lineTo(next.x, next.y);
-        context.stroke();
+        if (lastPoint) {
+            context.beginPath();
+            context.moveTo(lastPoint.x, lastPoint.y);
+            context.lineTo(next.x, next.y);
+            context.stroke();
+        } else {
+            context.beginPath();
+            context.arc(next.x, next.y, Number(size.value) / 2, 0, Math.PI * 2);
+            context.fill();
+        }
         context.restore();
         lastPoint = next;
         state.masksDirty = true;
+    }
+
+    function draw(event) {
+        if (frame < settings.selection_start || frame >= settings.selection_end) return;
+        const samples = event.getCoalescedEvents?.();
+        for (const sample of samples?.length ? samples : [event]) drawPoint(sample);
         renderOverlay();
     }
 
     overlayCanvas.onpointerdown = (event) => {
-        if (settings.mode !== "inpaint") return;
+        if (settings.mode !== "inpaint" || frame < settings.selection_start || frame >= settings.selection_end) return;
         video.pause();
         drawing = true;
         lastPoint = null;
         overlayCanvas.setPointerCapture(event.pointerId);
         draw(event);
     };
-    overlayCanvas.onpointermove = (event) => drawing && draw(event);
-    overlayCanvas.onpointerup = overlayCanvas.onpointercancel = () => { drawing = false; lastPoint = null; };
+    overlayCanvas.onpointermove = (event) => {
+        updateBrushCursor(event);
+        if (drawing) draw(event);
+    };
+    overlayCanvas.onpointerenter = updateBrushCursor;
+    overlayCanvas.onpointerleave = () => {
+        if (!drawing) {
+            cursorPoint = null;
+            updateBrushCursor();
+        }
+    };
+    overlayCanvas.onpointerup = overlayCanvas.onpointercancel = () => {
+        drawing = false;
+        lastPoint = null;
+    };
 
     const transport = document.createElement("div");
     transport.className = "video-timeline-toolbar";
@@ -375,14 +445,23 @@ async function openTimeline(node) {
     function followPlayback() {
         if (video.paused || video.ended) { play.textContent = "▶"; return; }
         const next = Math.min(source.frame_count - 1, Math.floor(video.currentTime * source.fps));
-        if (next !== frame) showFrame(next, false);
+        if (next !== frame) {
+            frame = next;
+            requestedFrame = next;
+            renderOverlay();
+            updateTimeline();
+        }
         requestAnimationFrame(followPlayback);
     }
 
     const lanes = document.createElement("div");
     lanes.className = "video-timeline-lanes";
+    const ruler = document.createElement("div");
+    ruler.className = "video-timeline-lane video-timeline-ruler";
+    const rulerCanvas = makeCanvas(1200, 24);
+    ruler.append(rulerCanvas);
     const videoLabel = document.createElement("div");
-    videoLabel.className = "video-timeline-label";
+    videoLabel.className = "video-timeline-label video";
     videoLabel.textContent = "VIDEO";
     const audioLabel = document.createElement("div");
     audioLabel.className = "video-timeline-label audio";
@@ -399,9 +478,20 @@ async function openTimeline(node) {
     contextRange.className = "video-timeline-context";
     const selection = document.createElement("div");
     selection.className = "video-timeline-selection";
+    const startHandle = document.createElement("div");
+    startHandle.className = "video-timeline-handle start";
+    const startLabel = document.createElement("span");
+    startLabel.className = "video-timeline-handle-label";
+    startHandle.append(startLabel);
+    const endHandle = document.createElement("div");
+    endHandle.className = "video-timeline-handle end";
+    const endLabel = document.createElement("span");
+    endLabel.className = "video-timeline-handle-label";
+    endHandle.append(endLabel);
+    selection.append(startHandle, endHandle);
     const playhead = document.createElement("div");
     playhead.className = "video-timeline-playhead";
-    lanes.append(videoLabel, audioLabel, videoLane, audioLane, contextRange, selection, playhead);
+    lanes.append(ruler, videoLabel, audioLabel, videoLane, audioLane, contextRange, selection, playhead);
     editor.append(lanes);
 
     const laneStart = 72;
@@ -411,34 +501,62 @@ async function openTimeline(node) {
         return Math.min(source.frame_count, Math.round(x / (rect.width - laneStart) * source.frame_count));
     }
 
-    let drag = null;
-    selection.onpointerdown = (event) => {
-        const rect = selection.getBoundingClientRect();
-        const edge = 12;
-        drag = event.clientX - rect.left < edge ? "start" : rect.right - event.clientX < edge ? "end" : "move";
-        selection.setPointerCapture(event.pointerId);
-        selection.dragFrame = frameAt(event);
+    let timelineDrag = null;
+
+    function captureDrag(element, event, kind) {
+        const anchor = frameAt(event);
+        timelineDrag = { kind, anchor, last: anchor };
+        element.setPointerCapture(event.pointerId);
         event.stopPropagation();
-    };
-    selection.onpointermove = (event) => {
-        if (!drag) return;
+        event.preventDefault();
+    }
+
+    function updateDrag(event) {
+        if (!timelineDrag) return;
         const next = frameAt(event);
-        if (drag === "start") settings.selection_start = Math.min(settings.selection_end - 1, Math.max(0, next));
-        if (drag === "end") settings.selection_end = Math.max(settings.selection_start + 1, Math.min(source.frame_count, next));
-        if (drag === "move") {
-            const delta = next - selection.dragFrame;
+        if (timelineDrag.kind === "scrub") showFrame(Math.min(source.frame_count - 1, next));
+        if (timelineDrag.kind === "select") {
+            settings.selection_start = Math.min(timelineDrag.anchor, Math.min(source.frame_count - 1, next));
+            settings.selection_end = Math.max(settings.selection_start + 1, Math.min(source.frame_count, Math.max(timelineDrag.anchor, next)));
+            showFrame(Math.min(source.frame_count - 1, next));
+        }
+        if (timelineDrag.kind === "start") {
+            settings.selection_start = Math.min(settings.selection_end - 1, Math.max(0, next));
+            showFrame(settings.selection_start);
+        }
+        if (timelineDrag.kind === "end") {
+            settings.selection_end = Math.max(settings.selection_start + 1, Math.min(source.frame_count, next));
+            showFrame(settings.selection_end - 1);
+        }
+        if (timelineDrag.kind === "move") {
+            const delta = next - timelineDrag.last;
             const length = settings.selection_end - settings.selection_start;
             settings.selection_start = Math.max(0, Math.min(source.frame_count - length, settings.selection_start + delta));
             settings.selection_end = settings.selection_start + length;
-            selection.dragFrame = next;
+            timelineDrag.last = next;
+            showFrame(Math.max(settings.selection_start, Math.min(settings.selection_end - 1, frame + delta)));
         }
         updateTimeline();
-    };
-    selection.onpointerup = selection.onpointercancel = () => drag = null;
-    lanes.onpointerdown = (event) => {
-        const next = Math.min(source.frame_count - 1, frameAt(event));
-        showFrame(next);
-    };
+    }
+
+    function finishDrag() { timelineDrag = null; }
+    for (const scrubLane of [ruler, audioLane]) {
+        scrubLane.onpointerdown = (event) => { captureDrag(scrubLane, event, "scrub"); updateDrag(event); };
+        scrubLane.onpointermove = updateDrag;
+        scrubLane.onpointerup = scrubLane.onpointercancel = finishDrag;
+    }
+    videoLane.onpointerdown = (event) => { captureDrag(videoLane, event, "select"); updateDrag(event); };
+    videoLane.onpointermove = updateDrag;
+    videoLane.onpointerup = videoLane.onpointercancel = finishDrag;
+    selection.onpointerdown = (event) => captureDrag(selection, event, "move");
+    selection.onpointermove = updateDrag;
+    selection.onpointerup = selection.onpointercancel = finishDrag;
+    startHandle.onpointerdown = (event) => captureDrag(startHandle, event, "start");
+    startHandle.onpointermove = updateDrag;
+    startHandle.onpointerup = startHandle.onpointercancel = finishDrag;
+    endHandle.onpointerdown = (event) => captureDrag(endHandle, event, "end");
+    endHandle.onpointermove = updateDrag;
+    endHandle.onpointerup = endHandle.onpointercancel = finishDrag;
 
     const settingsRow = document.createElement("div");
     settingsRow.className = "video-timeline-toolbar";
@@ -451,7 +569,10 @@ async function openTimeline(node) {
     before.oninput = () => { settings.context_before = Math.max(0, Number(before.value)); updateTimeline(); };
     after.oninput = () => { settings.context_after = Math.max(0, Number(after.value)); updateTimeline(); };
     settingsRow.append("Context before", before, "seconds", "Context after", after, "seconds");
-    editor.append(settingsRow);
+    const actionHint = document.createElement("span");
+    actionHint.className = "video-timeline-range-readout";
+    settingsRow.append(actionHint);
+    editor.append(settingsRow, modes, paintTools);
 
     function updateTimeline() {
         const width = source.frame_count;
@@ -465,6 +586,29 @@ async function openTimeline(node) {
         contextRange.style.width = `calc((100% - 72px) * ${(contextEnd - contextStart) / width})`;
         playhead.style.left = `calc(72px + (100% - 72px) * ${(frame + 0.5) / width})`;
         timeLabel.textContent = `Frame ${frame + 1}/${width}  •  ${(frame / source.fps).toFixed(2)}s  •  selection ${(settings.selection_start / source.fps).toFixed(2)}–${(settings.selection_end / source.fps).toFixed(2)}s`;
+        startLabel.textContent = `IN ${(settings.selection_start / source.fps).toFixed(2)}s`;
+        endLabel.textContent = `OUT ${(settings.selection_end / source.fps).toFixed(2)}s`;
+        actionHint.textContent = `${settings.selection_end - settings.selection_start} frames selected`;
+        updateBrushCursor();
+    }
+
+    function drawRuler() {
+        const context = rulerCanvas.getContext("2d");
+        context.fillStyle = "#181818";
+        context.fillRect(0, 0, rulerCanvas.width, rulerCanvas.height);
+        context.strokeStyle = "#777";
+        context.fillStyle = "#aaa";
+        context.font = "10px sans-serif";
+        const duration = source.frame_count / source.fps;
+        const divisions = Math.max(2, Math.min(12, Math.round(duration)));
+        for (let index = 0; index <= divisions; index++) {
+            const x = index / divisions * rulerCanvas.width;
+            context.beginPath();
+            context.moveTo(x, 15);
+            context.lineTo(x, 24);
+            context.stroke();
+            context.fillText(`${(index / divisions * duration).toFixed(1)}s`, Math.min(x + 3, rulerCanvas.width - 34), 11);
+        }
     }
 
     function drawWaveform() {
@@ -500,7 +644,7 @@ async function openTimeline(node) {
     actions.className = "video-timeline-toolbar";
     const spacer = document.createElement("span");
     spacer.className = "video-timeline-spacer";
-    const close = () => { video.pause(); backdrop.remove(); };
+    const close = () => { closed = true; video.pause(); backdrop.remove(); };
     actions.append(
         spacer,
         button("Save", async () => { await saveState(state, widget); close(); }),
@@ -511,8 +655,9 @@ async function openTimeline(node) {
     backdrop.onclick = (event) => event.target === backdrop && close();
 
     setMode(settings.mode);
+    drawRuler();
     drawWaveform();
-    drawThumbnails();
+    drawThumbnails().catch((error) => console.error(error));
     await showFrame(frame);
 }
 
