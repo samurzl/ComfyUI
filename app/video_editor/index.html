@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Comfy Cut</title>
-  <link rel="stylesheet" href="/video-editor/assets/styles.css?v=2">
+  <link rel="stylesheet" href="/video-editor/assets/styles.css?v=3">
 </head>
 <body>
   <header class="app-header">
@@ -22,6 +22,7 @@
       <button class="tool-button" id="link-button" title="Move linked video and audio together"><span>⛓</span> Linked</button>
     </nav>
     <div class="header-actions">
+      <button class="button secondary" id="export-button">Export MP4</button>
       <div class="backend-pill" id="backend-pill"><i></i><span>Checking ComfyUI…</span></div>
       <button class="icon-button" id="settings-button" title="Settings" aria-label="Settings">⚙</button>
     </div>
@@ -113,6 +114,6 @@
   <div id="modal-root"></div>
   <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
   <div class="media-runtime" id="media-runtime" aria-hidden="true"></div>
-  <script type="module" src="/video-editor/assets/app.js"></script>
+  <script type="module" src="/video-editor/assets/app.js?v=3"></script>
 </body>
 </html>

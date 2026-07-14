@@ -12,9 +12,15 @@ const defaultSettings = {
     ltxInpaintLora: "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors",
     ltxTextEncoder: "gemma_3_12B_it_fp4_mixed.safetensors",
     ltxSpatialUpscaler: "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-    kreaCheckpoint: "",
+    kreaDiffusionModel: "",
     kreaTextEncoder: "",
-    editAnythingLora: "",
+    kreaVae: "",
+    kreaEditLora: "",
+    kreaGroundingPx: 768,
+    editAnythingMode: "reference-visual",
+    editAnythingStandardLora: "",
+    editAnythingModuleLora: "",
+    loraLibrary: [],
     projectWidth: 1920,
     projectHeight: 1080,
     projectFps: 30,
@@ -35,7 +41,7 @@ const state = {
         media: [],
     },
     settings: { ...defaultSettings, ...readSettings() },
-    backend: { online: false, models: {}, socket: null, jobs: new Map() },
+    backend: { online: false, models: {}, nodeTypes: new Set(), socket: null, jobs: new Map() },
     selectedClipId: null,
     tool: "select",
     linkMode: true,
@@ -44,6 +50,7 @@ const state = {
     playStartedAt: 0,
     playStartedFrom: 0,
     pixelsPerSecond: 90,
+    previewZoom: null,
     clipboard: null,
     undo: [],
     redo: [],
@@ -62,7 +69,11 @@ const runtimeRoot = $("#media-runtime");
 
 function readSettings() {
     try {
-        return JSON.parse(localStorage.getItem("comfy-cut-settings") || "{}");
+        const settings = JSON.parse(localStorage.getItem("comfy-cut-settings") || "{}");
+        settings.loraLibrary = Array.isArray(settings.loraLibrary) ? settings.loraLibrary : [];
+        delete settings.kreaCheckpoint;
+        delete settings.editAnythingLora;
+        return settings;
     } catch {
         return {};
     }
@@ -134,6 +145,10 @@ function selected() {
 
 function projectDuration() {
     return Math.max(10, ...state.project.tracks.flatMap((track) => track.clips.map((clip) => clip.start + clip.duration)));
+}
+
+function sequenceDuration() {
+    return Math.max(0, ...state.project.tracks.filter((track) => track.enabled).flatMap((track) => track.clips.map((clip) => clip.start + clip.duration)));
 }
 
 function formatClock(seconds, includeFrames = false) {
@@ -248,8 +263,8 @@ function renderTrack(track) {
     };
     content.onpointerdown = (event) => {
         if (event.target !== content) return;
-        setPlayhead(pointerTime(event, content));
         selectClip(null);
+        startTimelineScrub(event);
     };
     for (const clip of track.clips) content.append(renderClip(clip, track));
     return row;
@@ -271,6 +286,31 @@ function renderClip(clip, track) {
 function pointerTime(event, content) {
     const rect = content.getBoundingClientRect();
     return roundFrame(Math.max(0, (event.clientX - rect.left) / state.pixelsPerSecond));
+}
+
+function timelinePointerTime(event) {
+    const rect = $("#ruler").getBoundingClientRect();
+    return roundFrame(Math.max(0, (event.clientX - rect.left) / state.pixelsPerSecond));
+}
+
+function startTimelineScrub(event) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    const pointerId = event.pointerId;
+    const update = (pointerEvent) => setPlayhead(timelinePointerTime(pointerEvent));
+    target.setPointerCapture?.(pointerId);
+    update(event);
+    const move = (moveEvent) => update(moveEvent);
+    const up = (upEvent) => {
+        if (target.hasPointerCapture?.(pointerId)) target.releasePointerCapture(pointerId);
+        target.removeEventListener("pointermove", move);
+        target.removeEventListener("pointerup", up);
+        target.removeEventListener("pointercancel", up);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
 }
 
 function startClipPointer(event, clip, track, element) {
@@ -601,6 +641,13 @@ function runtimeElement(clip, kind) {
         element.playsInline = true;
         element.dataset.url = media.url;
         if (kind === "video") element.muted = true;
+        if (kind === "video") {
+            const refreshPausedPreview = () => {
+                if (!state.playing && activeClips("video").some(({ clip: active }) => active.id === clip.id)) drawPreview();
+            };
+            element.addEventListener("loadeddata", refreshPausedPreview);
+            element.addEventListener("seeked", refreshPausedPreview);
+        }
         runtimeRoot.append(element);
         state.runtime.set(clip.id, element);
     }
@@ -648,6 +695,7 @@ function drawPreview() {
         previewCanvas.width = state.project.width;
         previewCanvas.height = state.project.height;
     }
+    applyPreviewSize();
     previewContext.fillStyle = "#050505";
     previewContext.fillRect(0, 0, previewCanvas.width, previewCanvas.height);
     syncRuntime();
@@ -676,6 +724,19 @@ function drawPreview() {
         previewContext.restore();
     }
     updateViewerLabels();
+}
+
+function applyPreviewSize() {
+    const wrap = $("#canvas-wrap");
+    const availableWidth = Math.max(1, wrap.clientWidth - 40);
+    const availableHeight = Math.max(1, wrap.clientHeight - 28);
+    const fitScale = Math.min(availableWidth / previewCanvas.width, availableHeight / previewCanvas.height);
+    const scale = state.previewZoom || fitScale;
+    previewCanvas.style.maxWidth = "none";
+    previewCanvas.style.maxHeight = "none";
+    previewCanvas.style.width = `${Math.max(1, previewCanvas.width * scale)}px`;
+    previewCanvas.style.height = `${Math.max(1, previewCanvas.height * scale)}px`;
+    $("#fit-button").title = state.previewZoom ? `Reset ${Math.round(scale * 100)}% zoom to fit` : `Preview fitted at ${Math.round(fitScale * 100)}%`;
 }
 
 function togglePlay() {
@@ -850,15 +911,22 @@ async function checkBackend() {
 }
 
 async function loadModelLists() {
-    const folders = ["checkpoints", "loras", "text_encoders", "latent_upscale_models"];
-    await Promise.all(folders.map(async (folder) => {
+    const folders = ["checkpoints", "diffusion_models", "loras", "text_encoders", "vae", "latent_upscale_models"];
+    await Promise.all([...folders.map(async (folder) => {
         try {
             const response = await apiFetch(`/models/${folder}`);
             if (response.ok) state.backend.models[folder] = await response.json();
         } catch {
             state.backend.models[folder] = [];
         }
-    }));
+    }), (async () => {
+        try {
+            const response = await apiFetch("/object_info");
+            if (response.ok) state.backend.nodeTypes = new Set(Object.keys(await response.json()));
+        } catch {
+            state.backend.nodeTypes = new Set();
+        }
+    })()]);
 }
 
 const clientId = crypto.randomUUID();
@@ -1010,9 +1078,12 @@ async function imageBlobAt(clip, clipTime) {
     video.src = media.url;
     video.preload = "auto";
     video.muted = true;
-    await waitFor(video, "loadedmetadata");
-    video.currentTime = clamp(clip.sourceIn + clipTime, 0, Math.max(0, video.duration - 0.001));
-    await waitFor(video, "seeked");
+    await waitFor(video, "loadeddata");
+    const sourceTime = clamp(clip.sourceIn + clipTime, 0, Math.max(0, video.duration - 0.001));
+    if (Math.abs(video.currentTime - sourceTime) > .001) {
+        video.currentTime = sourceTime;
+        await waitFor(video, "seeked");
+    }
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -1022,6 +1093,7 @@ async function imageBlobAt(clip, clipTime) {
 
 function waitFor(element, event) {
     if (event === "loadedmetadata" && element.readyState >= 1) return Promise.resolve();
+    if (event === "loadeddata" && element.readyState >= 2) return Promise.resolve();
     return new Promise((resolve, reject) => {
         element.addEventListener(event, resolve, { once: true });
         element.addEventListener("error", () => reject(new Error("Could not decode media")), { once: true });
@@ -1073,7 +1145,88 @@ function nodeTitleIncludes(text) {
     return (node) => (node._meta?.title || "").toLowerCase().includes(needle);
 }
 
-async function buildInpaintPrompt(clip, promptText, seed, maskData) {
+function appendModelLoras(prompt, modelLink, loras, prefix = 9500) {
+    let link = modelLink;
+    let nodeId = prefix;
+    for (const lora of loras) {
+        if (!lora.file || Number(lora.strength) === 0) continue;
+        while (prompt[String(nodeId)]) nodeId++;
+        prompt[String(nodeId)] = { inputs: { model: link, lora_name: lora.file, strength_model: Number(lora.strength) }, class_type: "LoraLoaderModelOnly", _meta: { title: `Comfy Cut · ${lora.name || lora.file}` } };
+        link = [String(nodeId), 0];
+        nodeId++;
+    }
+    return link;
+}
+
+function appendGenerationLoras(prompt, loras) {
+    if (!loras.length) return;
+    let prefix = 9500;
+    for (const node of Object.values(prompt)) {
+        if (!/(Guider|Sampler)$/.test(node.class_type) || !Array.isArray(node.inputs.model)) continue;
+        node.inputs.model = appendModelLoras(prompt, node.inputs.model, loras, prefix);
+        prefix += 100;
+    }
+}
+
+function generationLoraPicker(root, family) {
+    const loras = (state.settings.loraLibrary || []).filter((lora) => lora.family === family && lora.file);
+    const wrapper = document.createElement("div");
+    wrapper.className = "generation-loras";
+    wrapper.innerHTML = `<div class="section-title"><strong>LoRA stack</strong><button class="reset-link open-lora-settings">Manage library</button></div>`;
+    $(".open-lora-settings", wrapper).onclick = () => openSettings("loras");
+    if (!loras.length) {
+        wrapper.insertAdjacentHTML("beforeend", `<span class="form-help">No ${family === "ltx" ? "LTX" : "Krea"} LoRAs are defined. Add them in Settings → LoRAs.</span>`);
+    }
+    for (const lora of loras) {
+        const row = document.createElement("label");
+        row.className = "generation-lora-row";
+        row.dataset.loraId = lora.id;
+        row.innerHTML = `<input class="enabled" type="checkbox" ${lora.default ? "checked" : ""}><span><strong>${escapeHtml(lora.name || lora.file)}</strong><small>${escapeHtml(lora.file)}</small></span><input class="strength" type="number" min="-10" max="10" step="0.05" value="${Number(lora.strength ?? 1)}" title="Model strength">`;
+        wrapper.append(row);
+    }
+    root.append(wrapper);
+    return () => $$(".generation-lora-row", wrapper).filter((row) => $(".enabled", row).checked).map((row) => {
+        const lora = loras.find((item) => item.id === row.dataset.loraId);
+        return { ...lora, strength: Number($(".strength", row).value) };
+    });
+}
+
+function requireNodes(types, feature) {
+    if (!state.backend.nodeTypes.size) return;
+    const missing = types.filter((type) => !state.backend.nodeTypes.has(type));
+    if (missing.length) throw new Error(`${feature} needs these local custom nodes: ${missing.join(", ")}`);
+}
+
+function configureEditAnythingWorkflow(prompt) {
+    const nodes = Object.values(prompt);
+    const moduleEntry = Object.entries(prompt).find(([, node]) => node.class_type === "LTXVEditAnythingModuleLoader");
+    const moduleLoader = moduleEntry?.[1];
+    const samplers = nodes.filter((node) => node.class_type === "LTXVEditAnythingLoopingSampler");
+    if (!moduleLoader || !samplers.length) throw new Error("The reference workflow must contain LTXVEditAnythingModuleLoader and LTXVEditAnythingLoopingSampler");
+    const standardLoaders = nodes.filter((node) => node.class_type === "LoraLoaderModelOnly" && ((node._meta?.title || "").toLowerCase().includes("editanything standard") || node.inputs.lora_name === state.settings.editAnythingStandardLora));
+    if (!standardLoaders.length) throw new Error("Name the standard LoRA loader ‘EditAnything standard’ or use {{edit_anything_standard_lora}} as its lora_name");
+    moduleLoader.inputs.module_name = state.settings.editAnythingModuleLora;
+    for (const loader of standardLoaders) loader.inputs.lora_name = state.settings.editAnythingStandardLora;
+    const visual = state.settings.editAnythingMode === "reference-visual";
+    for (const sampler of samplers) {
+        sampler.inputs.editanything_module = [moduleEntry[0], 0];
+        sampler.inputs.lora_name = "(none)";
+        sampler.inputs.enable_ic_lora = true;
+        sampler.inputs.enable_adaln = true;
+        sampler.inputs.reapply_per_chunk = true;
+        sampler.inputs.enable_visual_crossattn = visual;
+        sampler.inputs.enable_role_embedding = !visual;
+        if (visual) {
+            sampler.inputs.ref_context_scale = .01;
+            sampler.inputs.ref_token_scale = .25;
+            sampler.inputs.ref_start_block = 12;
+            sampler.inputs.ref_end_block = 35;
+            sampler.inputs.ref_init_from = "attn2";
+        }
+    }
+}
+
+async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) {
     const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
     const graph = data.definitions.subgraphs[0];
     const { prompt } = graphToPrompt(graph);
@@ -1095,10 +1248,11 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData) {
     setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
+    appendGenerationLoras(prompt, loras);
     return prompt;
 }
 
-async function buildI2VPrompt(imageReference, clip, promptText, seed) {
+async function buildI2VPrompt(imageReference, clip, promptText, seed, loras = []) {
     const data = await blueprint("Image to Video (LTX-2.3).json");
     const graph = data.definitions.subgraphs[0];
     const width = Math.max(64, Math.round(state.project.width / 32) * 32);
@@ -1114,6 +1268,7 @@ async function buildI2VPrompt(imageReference, clip, promptText, seed) {
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     const outputLink = graph.outputs[0]?.linkIds?.[0];
     prompt["9001"] = { inputs: { video: resolveLink(outputLink), filename_prefix: "video/ComfyCut_i2v", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Comfy Cut output" } };
+    appendGenerationLoras(prompt, loras);
     return prompt;
 }
 
@@ -1141,22 +1296,29 @@ function buildSamPrompt(videoReference, clip, promptText, options) {
     };
 }
 
-function buildKreaImageEditPrompt(imageReference, promptText, seed, width, height) {
-    width = Math.max(64, Math.round(width / 32) * 32);
-    height = Math.max(64, Math.round(height / 32) * 32);
-    return {
+function buildKreaImageEditPrompt(imageReference, promptText, seed, width, height, loras = []) {
+    const scale = Math.min(1, Math.sqrt(2_000_000 / Math.max(1, width * height)));
+    width = Math.max(64, Math.round(width * scale / 16) * 16);
+    height = Math.max(64, Math.round(height * scale / 16) * 16);
+    const groundingPx = Number.isFinite(Number(state.settings.kreaGroundingPx)) ? Number(state.settings.kreaGroundingPx) : 768;
+    const prompt = {
         "1": { inputs: { image: annotatedResource(imageReference) }, class_type: "LoadImage", _meta: { title: "Source frame" } },
-        "2": { inputs: { ckpt_name: state.settings.kreaCheckpoint }, class_type: "CheckpointLoaderSimple", _meta: { title: "Krea 2 Edit" } },
-        "3": { inputs: { clip: ["2", 1], text: promptText }, class_type: "CLIPTextEncode", _meta: { title: "Edit instruction" } },
-        "4": { inputs: { clip: ["2", 1], text: "" }, class_type: "CLIPTextEncode", _meta: { title: "Negative prompt" } },
-        "5": { inputs: { pixels: ["1", 0], vae: ["2", 2] }, class_type: "VAEEncode", _meta: { title: "Reference latent" } },
-        "6": { inputs: { conditioning: ["3", 0], latent: ["5", 0] }, class_type: "ReferenceLatent", _meta: { title: "Attach reference" } },
-        "7": { inputs: { conditioning: ["4", 0], latent: ["5", 0] }, class_type: "ReferenceLatent", _meta: { title: "Attach negative reference" } },
-        "8": { inputs: { width, height, batch_size: 1 }, class_type: "EmptySD3LatentImage", _meta: { title: "Output size" } },
-        "9": { inputs: { model: ["2", 0], seed, steps: 20, cfg: 1, sampler_name: "euler", scheduler: "simple", positive: ["6", 0], negative: ["7", 0], latent_image: ["8", 0], denoise: 1 }, class_type: "KSampler", _meta: { title: "Krea sampling" } },
-        "10": { inputs: { samples: ["9", 0], vae: ["2", 2] }, class_type: "VAEDecode", _meta: { title: "Decode edit" } },
-        "11": { inputs: { images: ["10", 0], filename_prefix: "ComfyCut/Krea_edit" }, class_type: "SaveImage", _meta: { title: "Save edit" } },
+        "2": { inputs: { image: ["1", 0], upscale_method: "area", width, height, crop: "disabled" }, class_type: "ImageScale", _meta: { title: "Match edit resolution" } },
+        "3": { inputs: { unet_name: state.settings.kreaDiffusionModel, weight_dtype: "default" }, class_type: "UNETLoader", _meta: { title: "Krea 2 Turbo FP8" } },
+        "4": { inputs: { clip_name: state.settings.kreaTextEncoder, type: "krea2", device: "default" }, class_type: "CLIPLoader", _meta: { title: "Krea 2 Qwen3-VL" } },
+        "5": { inputs: { vae_name: state.settings.kreaVae }, class_type: "VAELoader", _meta: { title: "Krea 2 VAE" } },
+        "6": { inputs: { pixels: ["2", 0], vae: ["5", 0] }, class_type: "VAEEncode", _meta: { title: "Source appearance latent" } },
+        "7": { inputs: { model: ["3", 0], lora_name: state.settings.kreaEditLora, strength_model: 1 }, class_type: "LoraLoaderModelOnly", _meta: { title: "Krea 2 Edit LoRA" } },
+        "8": { inputs: { model: ["7", 0], source_latent: ["6", 0] }, class_type: "Krea2EditModelPatch", _meta: { title: "Krea 2 source patch" } },
+        "9": { inputs: { clip: ["4", 0], image: ["2", 0], prompt: promptText, grounding_px: groundingPx }, class_type: "Krea2EditGroundedEncode", _meta: { title: "Grounded edit instruction" } },
+        "10": { inputs: { clip: ["4", 0], image: ["2", 0], prompt: "", grounding_px: groundingPx }, class_type: "Krea2EditGroundedEncode", _meta: { title: "Grounded negative" } },
+        "11": { inputs: { width, height, batch_size: 1 }, class_type: "EmptySD3LatentImage", _meta: { title: "Output size" } },
+        "12": { inputs: { model: ["8", 0], seed, steps: 8, cfg: 1, sampler_name: "euler", scheduler: "simple", positive: ["9", 0], negative: ["10", 0], latent_image: ["11", 0], denoise: 1 }, class_type: "KSampler", _meta: { title: "Krea 2 Turbo sampling" } },
+        "13": { inputs: { samples: ["12", 0], vae: ["5", 0] }, class_type: "VAEDecode", _meta: { title: "Decode edit" } },
+        "14": { inputs: { images: ["13", 0], filename_prefix: "ComfyCut/Krea_edit" }, class_type: "SaveImage", _meta: { title: "Save edit" } },
     };
+    prompt["8"].inputs.model = appendModelLoras(prompt, ["7", 0], loras);
+    return prompt;
 }
 
 function customWorkflow(json, values) {
@@ -1230,7 +1392,7 @@ async function frameEditor(clip, canvas, onDraw = null) {
     video.src = media.url;
     video.preload = "auto";
     video.muted = true;
-    await waitFor(video, "loadedmetadata");
+    await waitFor(video, "loadeddata");
     canvas.width = media.width;
     canvas.height = media.height;
     const context = canvas.getContext("2d");
@@ -1249,8 +1411,11 @@ async function frameEditor(clip, canvas, onDraw = null) {
         seeking = true;
         while (lastTime !== requested) {
             const target = requested;
-            video.currentTime = clamp(clip.sourceIn + target, 0, Math.max(0, video.duration - 0.001));
-            await waitFor(video, "seeked");
+            const sourceTime = clamp(clip.sourceIn + target, 0, Math.max(0, video.duration - 0.001));
+            if (Math.abs(video.currentTime - sourceTime) > .001) {
+                video.currentTime = sourceTime;
+                await waitFor(video, "seeked");
+            }
             lastTime = target;
             draw();
         }
@@ -1304,11 +1469,12 @@ async function openSimpleMask() {
     const clip = result.clip;
     const working = structuredClone(clip.mask || { sam: null, shapes: [], corrections: [], morphology: 0 });
     working.shapes ||= [];
+    working.corrections ||= [];
     const modal = openModal("Simple mask", clip.name, "mask-modal");
-    modal.body.innerHTML = `<div class="modal-grid"><div><div class="mask-toolbar"><button data-tool="rectangle" class="active">Rectangle</button><button data-tool="circle">Circle</button><button data-tool="select">Select</button><button data-action="delete">Delete shape</button></div><div class="modal-preview"><canvas></canvas></div><div class="mini-timeline"><i class="mini-range"></i><i class="mini-playhead"></i></div><input class="frame-scrub" type="range" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0" style="width:100%;accent-color:var(--accent)"></div><div class="form-stack"><label class="form-field"><span>Shape duration</span><div class="inline"><input class="shape-start" type="number" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0"><input class="shape-end" type="number" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="${clip.duration}"></div><small class="form-help">Start and end are relative to this clip.</small></label><div class="shape-list"></div><button class="button secondary clear-shapes">Clear simple masks</button></div></div>`;
+    modal.body.innerHTML = `<div class="modal-grid"><div><div class="mask-toolbar"><button data-tool="rectangle" class="active">Rectangle</button><button data-tool="circle">Circle</button><button data-tool="select">Select</button></div><div class="modal-preview"><canvas></canvas></div><div class="simple-mask-timeline"><div class="mask-time-ruler"><span>Shapes</span><div class="mask-ruler-lane"></div></div><div class="mask-track-list"></div><div class="mask-timeline-playhead-area"><i class="mask-timeline-playhead"></i></div></div><input class="frame-scrub" type="range" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0"></div><div class="form-stack"><div><span class="eyebrow">Selected shape</span><h3 class="selected-shape-title">No shape selected</h3></div><label class="form-field"><span>Shape timing</span><div class="inline"><input class="shape-start" type="number" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0" disabled><input class="shape-end" type="number" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="${clip.duration}" disabled></div><small class="form-help">Drag a shape bar or either edge in the timeline. Each shape has its own track.</small></label><button class="button secondary delete-shape" disabled>Delete selected shape</button><button class="button secondary clear-shapes">Clear simple masks</button></div></div>`;
     const canvas = $("canvas", modal.body);
     let currentTool = "rectangle";
-    let currentShapeId = null;
+    let currentShapeId = working.shapes[0]?.id || null;
     let dragStart = null;
     let draft = null;
     const samVideo = document.createElement("video");
@@ -1337,71 +1503,153 @@ async function openSimpleMask() {
         context.drawImage(maskOverlay, 0, 0);
         context.restore();
     });
+    let requestedTime = 0;
+    let samTime = -1;
+    let seeking = false;
     const seek = async (time) => {
-        await editor.seek(time);
-        if (!samVideo.src) return;
-        samVideo.currentTime = clamp((working.sam?.trimmed ? working.sam.offset || 0 : clip.sourceIn) + time, 0, Math.max(0, samVideo.duration - .001));
-        await waitFor(samVideo, "seeked");
-        editor.draw();
+        requestedTime = roundFrame(clamp(time, 0, Math.max(0, clip.duration - 1 / state.project.fps)));
+        $(".frame-scrub", modal.body).value = requestedTime;
+        updateTimeline();
+        if (seeking) return;
+        seeking = true;
+        while (editor.time !== requestedTime || (samVideo.src && samTime !== requestedTime)) {
+            const target = requestedTime;
+            await editor.seek(target);
+            if (samVideo.src) {
+                const sourceTime = clamp((working.sam?.trimmed ? working.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, samVideo.duration - .001));
+                if (Math.abs(samVideo.currentTime - sourceTime) > .001) {
+                    samVideo.currentTime = sourceTime;
+                    await waitFor(samVideo, "seeked");
+                }
+                samTime = target;
+                editor.draw();
+            }
+        }
+        seeking = false;
     };
     if (working.sam?.url) {
         samVideo.src = working.sam.url;
         await waitFor(samVideo, "loadedmetadata");
-        await seek(0);
     }
 
     const updateTimeline = () => {
-        const selectedShape = working.shapes.find((shape) => shape.id === currentShapeId);
-        const start = selectedShape?.start ?? Number($(".shape-start", modal.body).value);
-        const end = selectedShape?.end ?? Number($(".shape-end", modal.body).value);
-        $(".mini-range", modal.body).style.left = `${start / clip.duration * 100}%`;
-        $(".mini-range", modal.body).style.width = `${Math.max(0, end - start) / clip.duration * 100}%`;
-        $(".mini-playhead", modal.body).style.left = `${editor.time / clip.duration * 100}%`;
+        const duration = Math.max(clip.duration, 1 / state.project.fps);
+        $(".mask-timeline-playhead", modal.body).style.left = `${requestedTime / duration * 100}%`;
+        for (const shape of working.shapes) {
+            const range = $(`.mask-shape-range[data-shape-id="${shape.id}"]`, modal.body);
+            if (!range) continue;
+            range.style.left = `${shape.start / duration * 100}%`;
+            range.style.width = `${Math.max(1 / state.project.fps, shape.end - shape.start) / duration * 100}%`;
+            $("span", range).textContent = `${formatClock(shape.start)}–${formatClock(shape.end)}`;
+        }
     };
-    const renderList = () => {
-        const list = $(".shape-list", modal.body);
-        list.innerHTML = working.shapes.length ? "" : '<span class="form-help">Draw a rectangle or circle on the video. Each shape can have its own duration.</span>';
+    const updateSelection = () => {
+        const shape = working.shapes.find((candidate) => candidate.id === currentShapeId);
+        const index = working.shapes.indexOf(shape);
+        $(".selected-shape-title", modal.body).textContent = shape ? `${shape.type === "circle" ? "Circle" : "Rectangle"} ${index + 1}` : "No shape selected";
+        $(".shape-start", modal.body).disabled = !shape;
+        $(".shape-end", modal.body).disabled = !shape;
+        $(".delete-shape", modal.body).disabled = !shape;
+        if (shape) {
+            $(".shape-start", modal.body).value = shape.start;
+            $(".shape-end", modal.body).value = shape.end;
+        } else {
+            $(".shape-start", modal.body).value = 0;
+            $(".shape-end", modal.body).value = clip.duration;
+        }
+        $$(".mask-track-row", modal.body).forEach((row) => row.classList.toggle("selected", row.dataset.shapeId === currentShapeId));
+    };
+    const timelineTime = (event, lane) => {
+        const rect = lane.getBoundingClientRect();
+        return roundFrame(clamp((event.clientX - rect.left) / rect.width * clip.duration, 0, clip.duration));
+    };
+    const bindScrub = (lane) => {
+        lane.onpointerdown = (event) => {
+            if (event.button !== 0 || event.target.closest(".mask-shape-range")) return;
+            lane.setPointerCapture(event.pointerId);
+            seek(timelineTime(event, lane));
+            lane.onpointermove = (moveEvent) => seek(timelineTime(moveEvent, lane));
+            lane.onpointerup = () => { lane.onpointermove = null; lane.onpointerup = null; };
+        };
+    };
+    const startRangeDrag = (event, shape, lane, mode) => {
+        event.stopPropagation();
+        currentShapeId = shape.id;
+        updateSelection();
+        const target = event.currentTarget;
+        const pointerStart = timelineTime(event, lane);
+        const originalStart = shape.start;
+        const originalEnd = shape.end;
+        const minimum = 1 / state.project.fps;
+        target.setPointerCapture(event.pointerId);
+        target.onpointermove = (moveEvent) => {
+            const pointer = timelineTime(moveEvent, lane);
+            if (mode === "start") shape.start = clamp(pointer, 0, shape.end - minimum);
+            else if (mode === "end") shape.end = clamp(pointer, shape.start + minimum, clip.duration);
+            else {
+                const length = originalEnd - originalStart;
+                const start = clamp(originalStart + pointer - pointerStart, 0, clip.duration - length);
+                shape.start = roundFrame(start);
+                shape.end = roundFrame(start + length);
+            }
+            updateSelection();
+            updateTimeline();
+            seek(pointer);
+            editor.draw();
+        };
+        target.onpointerup = () => { target.onpointermove = null; target.onpointerup = null; };
+    };
+    const renderTracks = () => {
+        const list = $(".mask-track-list", modal.body);
+        list.innerHTML = working.shapes.length ? "" : '<div class="mask-track-empty">Draw a rectangle or circle to add a shape track.</div>';
         working.shapes.forEach((shape, index) => {
-            const item = document.createElement("button");
-            item.className = `asset-chip${shape.id === currentShapeId ? " selected" : ""}`;
-            item.style.width = "100%";
-            item.innerHTML = `<span class="mask-icon">${shape.type === "circle" ? "○" : "□"}</span><div><strong>${shape.type === "circle" ? "Circle" : "Rectangle"} ${index + 1}</strong><small>${formatClock(shape.start)}–${formatClock(shape.end)}</small></div>`;
-            item.onclick = () => {
+            const row = document.createElement("div");
+            row.className = "mask-track-row";
+            row.dataset.shapeId = shape.id;
+            row.innerHTML = `<button class="mask-track-label"><span>${shape.type === "circle" ? "○" : "□"}</span>${shape.type === "circle" ? "Circle" : "Rectangle"} ${index + 1}</button><div class="mask-track-lane"><div class="mask-shape-range" data-shape-id="${shape.id}"><i class="mask-range-handle left"></i><span>${formatClock(shape.start)}–${formatClock(shape.end)}</span><i class="mask-range-handle right"></i></div></div>`;
+            const lane = $(".mask-track-lane", row);
+            $(".mask-track-label", row).onclick = () => {
                 currentShapeId = shape.id;
-                $(".shape-start", modal.body).value = shape.start;
-                $(".shape-end", modal.body).value = shape.end;
-                renderList();
-                updateTimeline();
+                updateSelection();
             };
-            list.append(item);
+            const range = $(".mask-shape-range", row);
+            range.onpointerdown = (event) => startRangeDrag(event, shape, lane, "move");
+            $(".mask-range-handle.left", row).onpointerdown = (event) => startRangeDrag(event, shape, lane, "start");
+            $(".mask-range-handle.right", row).onpointerdown = (event) => startRangeDrag(event, shape, lane, "end");
+            bindScrub(lane);
+            list.append(row);
         });
+        updateSelection();
+        updateTimeline();
     };
     const selectTool = (tool) => {
         currentTool = tool;
         $$('[data-tool]', modal.body).forEach((button) => button.classList.toggle("active", button.dataset.tool === tool));
     };
     $$('[data-tool]', modal.body).forEach((button) => button.onclick = () => selectTool(button.dataset.tool));
-    $("[data-action=delete]", modal.body).onclick = () => {
+    $(".delete-shape", modal.body).onclick = () => {
         if (!currentShapeId) return;
         working.shapes = working.shapes.filter((shape) => shape.id !== currentShapeId);
-        currentShapeId = null;
-        renderList();
+        currentShapeId = working.shapes[0]?.id || null;
+        renderTracks();
         editor.draw();
     };
     $(".clear-shapes", modal.body).onclick = () => {
         working.shapes = [];
         currentShapeId = null;
-        renderList();
+        renderTracks();
         editor.draw();
     };
-    $(".frame-scrub", modal.body).oninput = async (event) => { await seek(Number(event.target.value)); updateTimeline(); };
+    $(".frame-scrub", modal.body).oninput = (event) => seek(Number(event.target.value));
+    bindScrub($(".mask-ruler-lane", modal.body));
     for (const selector of [".shape-start", ".shape-end"]) {
         $(selector, modal.body).onchange = (event) => {
             const shape = working.shapes.find((candidate) => candidate.id === currentShapeId);
             if (!shape) return;
-            shape[selector.endsWith("start") ? "start" : "end"] = Number(event.target.value);
-            shape.end = Math.max(shape.start + 1 / state.project.fps, shape.end);
-            renderList();
+            const minimum = 1 / state.project.fps;
+            if (selector.endsWith("start")) shape.start = clamp(roundFrame(Number(event.target.value)), 0, shape.end - minimum);
+            else shape.end = clamp(roundFrame(Number(event.target.value)), shape.start + minimum, clip.duration);
+            updateSelection();
             updateTimeline();
             editor.draw();
         };
@@ -1429,8 +1677,7 @@ async function openSimpleMask() {
             currentShapeId = draft.id;
         }
         draft = null;
-        renderList();
-        updateTimeline();
+        renderTracks();
         editor.draw();
     };
     modalButton(modal, "Cancel", closeModal);
@@ -1441,8 +1688,8 @@ async function openSimpleMask() {
         renderAll();
         toast("Mask saved", "Simple masks were added to this clip.");
     }, "primary");
-    renderList();
-    updateTimeline();
+    renderTracks();
+    seek(0);
 }
 
 async function openSamMask() {
@@ -1766,9 +2013,11 @@ async function bakeClip(clip, onProgress = () => {}) {
     video.preload = "auto";
     video.muted = false;
     video.playsInline = true;
-    await waitFor(video, "loadedmetadata");
-    video.currentTime = clip.sourceIn;
-    await waitFor(video, "seeked");
+    await waitFor(video, "loadeddata");
+    if (Math.abs(video.currentTime - clip.sourceIn) > .001) {
+        video.currentTime = clip.sourceIn;
+        await waitFor(video, "seeked");
+    }
     const canvas = document.createElement("canvas");
     canvas.width = state.project.width;
     canvas.height = state.project.height;
@@ -1848,6 +2097,7 @@ async function openInpaint() {
     const modal = openModal("Inpaint", sourceClip.name, "wide");
     modal.body.innerHTML = `<div class="modal-grid"><div class="generation-preview"><video class="source-preview" src="${escapeHtml(findMedia(sourceClip.mediaId).url)}" controls></video><span class="generation-empty" hidden></span></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe what should replace the masked area"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" min="0" max="9007199254740991" value="${randomSeed()}"></label><label class="toggle-row"><span>Use clip scale, position, and rotation</span><input class="use-transform" type="checkbox"></label><small class="form-help">When enabled, the transform is baked before generation. Empty canvas areas become outpainting regions. Baking takes the clip's duration in real time.</small><button class="button primary generate">Generate</button><div class="job-slot"></div></div></div>`;
     const sourceVideo = $(".source-preview", modal.body);
+    const selectedLoras = generationLoraPicker($(".form-stack", modal.body), "ltx");
     sourceVideo.currentTime = sourceClip.sourceIn;
     let output = null;
     let generatedSourceIn = sourceClip.sourceIn;
@@ -1870,7 +2120,7 @@ async function openInpaint() {
                 generatedSourceIn = 0;
             } else generatedSourceIn = sourceClip.sourceIn;
             const atlas = await makeMaskAtlas(clip, job.callbacks.onProgress);
-            const workflow = await buildInpaintPrompt(clip, promptText, Number($(".seed", modal.body).value), atlas);
+            const workflow = await buildInpaintPrompt(clip, promptText, Number($(".seed", modal.body).value), atlas, selectedLoras());
             jobSlot.addEventListener("preview", (event) => showJobImage(preview, event.detail), { once: false });
             jobSlot.addEventListener("intermediate", (event) => {
                 if (event.detail.nodeId === "2") return;
@@ -1983,20 +2233,29 @@ async function openImageEdit() {
     modal.body.innerHTML = `<div class="modal-grid"><div><div class="generation-preview frame-preview"><canvas></canvas></div><input class="frame-scrub" type="range" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0" style="width:100%;accent-color:var(--accent);margin-top:10px"><div class="generation-preview result-preview" hidden></div></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe how this frame should change"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" value="${randomSeed()}"></label><button class="button primary generate">Generate with Krea 2 Edit</button><div class="job-slot"></div></div></div>`;
     const canvas = $("canvas", modal.body);
     const editor = await frameEditor(clip, canvas);
+    const selectedLoras = generationLoraPicker($(".form-stack", modal.body), "krea");
     $(".frame-scrub", modal.body).oninput = (event) => editor.seek(Number(event.target.value));
     let output = null;
     $(".generate", modal.body).onclick = async () => {
         const promptText = $(".prompt", modal.body).value.trim();
         if (!promptText) return toast("Add an edit prompt", "Describe how the chosen frame should change.", "error");
-        if (!state.settings.kreaCheckpoint && !state.settings.imageEditWorkflow.trim()) {
-            return toast("Choose a Krea 2 model", "Open Settings → Models and select the Krea 2 Edit checkpoint.", "error");
+        if (!state.settings.imageEditWorkflow.trim() && (!state.settings.kreaDiffusionModel || !state.settings.kreaTextEncoder || !state.settings.kreaVae || !state.settings.kreaEditLora)) {
+            return toast("Complete the Krea 2 setup", "Choose the diffusion model, Qwen3-VL encoder, VAE, and edit LoRA in Settings → Models.", "error");
         }
         const job = generationStatus($(".job-slot", modal.body));
         try {
             const blob = await imageBlobAt(clip, editor.time);
             const reference = await uploadBlob(blob, `frame-${Date.now()}.png`);
             const values = workflowValues({ clip, prompt: promptText, seed: Number($(".seed", modal.body).value), sourceImage: reference, referenceImage: reference });
-            const workflow = state.settings.imageEditWorkflow.trim() ? customWorkflow(state.settings.imageEditWorkflow, values) : buildKreaImageEditPrompt(reference, promptText, values.seed, media.width, media.height);
+            const loras = selectedLoras();
+            let workflow;
+            if (state.settings.imageEditWorkflow.trim()) {
+                workflow = customWorkflow(state.settings.imageEditWorkflow, values);
+                appendGenerationLoras(workflow, loras);
+            } else {
+                requireNodes(["Krea2EditModelPatch", "Krea2EditGroundedEncode"], "Krea 2 image edit");
+                workflow = buildKreaImageEditPrompt(reference, promptText, values.seed, media.width, media.height, loras);
+            }
             const generated = await runPrompt(workflow, job.callbacks);
             const resource = pickResource(generated.resources, "image");
             if (!resource) throw new Error("The image edit workflow completed without an image output");
@@ -2039,14 +2298,20 @@ function workflowValues({ clip, prompt, seed, sourceImage, referenceImage, sourc
         ltx_inpaint_lora: state.settings.ltxInpaintLora,
         ltx_text_encoder: state.settings.ltxTextEncoder,
         ltx_spatial_upscaler: state.settings.ltxSpatialUpscaler,
-        krea_checkpoint: state.settings.kreaCheckpoint,
+        krea_diffusion_model: state.settings.kreaDiffusionModel,
         krea_text_encoder: state.settings.kreaTextEncoder,
-        edit_anything_lora: state.settings.editAnythingLora,
+        krea_vae: state.settings.kreaVae,
+        krea_edit_lora: state.settings.kreaEditLora,
+        edit_anything_standard_lora: state.settings.editAnythingStandardLora,
+        edit_anything_module_lora: state.settings.editAnythingModuleLora,
+        edit_anything_enable_visual_crossattn: state.settings.editAnythingMode === "reference-visual",
+        edit_anything_enable_role_embedding: state.settings.editAnythingMode === "reference-role",
+        edit_anything_enable_adaln: true,
         sam_checkpoint: state.settings.samCheckpoint,
     };
 }
 
-async function chooseAttachedImage(clip, title, onChoose) {
+async function chooseAttachedImage(clip, title, family, onChoose) {
     const modal = openModal(title, clip.name, "wide");
     modal.body.innerHTML = '<div class="asset-picker"></div>';
     const picker = $(".asset-picker", modal.body);
@@ -2066,6 +2331,7 @@ async function chooseAttachedImage(clip, title, onChoose) {
     controls.style.marginTop = "16px";
     controls.innerHTML = `<label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe the video you want to create"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" value="${randomSeed()}"></label><button class="button primary generate">Generate</button><div class="generation-preview result-preview"><span class="generation-empty">Choose an image, enter a prompt, and generate.</span></div><div class="job-slot"></div>`;
     modal.body.append(controls);
+    const selectedLoras = generationLoraPicker(controls, family);
     let output = null;
     $(".generate", controls).onclick = async () => {
         if (!selectedImage) return;
@@ -2073,7 +2339,7 @@ async function chooseAttachedImage(clip, title, onChoose) {
         if (!promptText) return toast("Add a prompt", "Describe the intended result.", "error");
         const job = generationStatus($(".job-slot", controls));
         try {
-            output = await onChoose(selectedImage, promptText, Number($(".seed", controls).value), job);
+            output = await onChoose(selectedImage, promptText, Number($(".seed", controls).value), job, selectedLoras());
             showJobVideo($(".result-preview", controls), resourceUrl(output));
             job.complete("Generation ready");
         } catch (error) {
@@ -2092,8 +2358,8 @@ async function openI2V() {
     const result = selected();
     if (!result || result.track.kind !== "video" || !result.clip.images?.length) return;
     const clip = result.clip;
-    await chooseAttachedImage(clip, "Image to video", async (image, promptText, seed, job) => {
-        const workflow = await buildI2VPrompt(image.resource, clip, promptText, seed);
+    await chooseAttachedImage(clip, "Image to video", "ltx", async (image, promptText, seed, job, loras) => {
+        const workflow = await buildI2VPrompt(image.resource, clip, promptText, seed, loras);
         const generated = await runPrompt(workflow, job.callbacks);
         const resource = pickResource(generated.resources, "video");
         if (!resource) throw new Error("The I2V workflow completed without a video output");
@@ -2105,16 +2371,29 @@ async function openRefEdit() {
     const result = selected();
     if (!result || result.track.kind !== "video" || !result.clip.images?.length) return;
     const clip = result.clip;
+    if (!state.settings.editAnythingStandardLora || !state.settings.editAnythingModuleLora) {
+        toast("Complete the EditAnything setup", "Select a matched standard and module LoRA pair in Settings → Models.", "error");
+        openSettings("models");
+        return;
+    }
+    try {
+        requireNodes(["LTXVEditAnythingModuleLoader", "LTXVEditAnythingLoopingSampler"], "EditAnything reference edit");
+    } catch (error) {
+        toast("EditAnything nodes are missing", error.message, "error");
+        return;
+    }
     if (!state.settings.refEditWorkflow.trim()) {
         toast("Reference workflow needed", "Add an EditAnything LTX 2.3 API workflow in Settings → Workflows.", "error");
         openSettings("workflows");
         return;
     }
-    await chooseAttachedImage(clip, "Reference edit", async (image, promptText, seed, job) => {
+    await chooseAttachedImage(clip, "Reference edit", "ltx", async (image, promptText, seed, job, loras) => {
         const media = findMedia(clip.mediaId);
         const sourceVideo = await ensureMediaUploaded(media);
         const values = workflowValues({ clip, prompt: promptText, seed, sourceVideo, referenceImage: image.resource });
         const workflow = customWorkflow(state.settings.refEditWorkflow, values);
+        configureEditAnythingWorkflow(workflow);
+        appendGenerationLoras(workflow, loras);
         const generated = await runPrompt(workflow, job.callbacks);
         const resource = pickResource(generated.resources, "video");
         if (!resource) throw new Error("The reference edit workflow completed without a video output");
@@ -2125,12 +2404,13 @@ async function openRefEdit() {
 function openSettings(initialPage = "models") {
     const modal = openModal("Settings", "Comfy Cut", "wide");
     modal.body.style.padding = "0";
-    modal.body.innerHTML = `<div class="settings-tabs"><nav class="settings-nav"><button data-page="models">Models</button><button data-page="project">Project</button><button data-page="workflows">Workflows</button><button data-page="about">About</button></nav><div class="settings-page"></div></div>`;
+    modal.body.innerHTML = `<div class="settings-tabs"><nav class="settings-nav"><button data-page="models">Models</button><button data-page="loras">LoRAs</button><button data-page="project">Project</button><button data-page="workflows">Workflows</button><button data-page="about">About</button></nav><div class="settings-page"></div></div>`;
     const draft = { ...structuredClone(state.settings), projectName: state.project.name };
     const renderPage = (page) => {
         $$('[data-page]', modal.body).forEach((button) => button.classList.toggle("active", button.dataset.page === page));
         const root = $(".settings-page", modal.body);
         if (page === "models") renderModelSettings(root, draft);
+        else if (page === "loras") renderLoraSettings(root, draft);
         else if (page === "project") renderProjectSettings(root, draft);
         else if (page === "workflows") renderWorkflowSettings(root, draft);
         else root.innerHTML = `<h3>About Comfy Cut</h3><p>A local, standalone video editor for ComfyUI. Media stays on this machine and AI jobs are sent only to the ComfyUI server that is serving this page.</p><div class="job-progress"><span>${state.backend.online ? "ComfyUI is connected" : "ComfyUI is unavailable"}</span><div class="progress-track"><i style="width:${state.backend.online ? 100 : 0}%"></i></div></div>`;
@@ -2170,9 +2450,53 @@ function renderModelSettings(root, draft) {
     modelInput(fields, draft, "In/Outpaint IC-LoRA", "ltxInpaintLora", "loras");
     modelInput(fields, draft, "LTX text encoder", "ltxTextEncoder", "text_encoders");
     modelInput(fields, draft, "LTX spatial upscaler", "ltxSpatialUpscaler", "latent_upscale_models");
-    modelInput(fields, draft, "Krea 2 Edit checkpoint", "kreaCheckpoint", "checkpoints", "Used by the built-in image edit workflow.");
-    modelInput(fields, draft, "Krea 2 text encoder", "kreaTextEncoder", "text_encoders", "Available as {{krea_text_encoder}} in a custom workflow.");
-    modelInput(fields, draft, "EditAnything IC-LoRA", "editAnythingLora", "loras", "Available as {{edit_anything_lora}} in the reference workflow.");
+    modelInput(fields, draft, "Krea 2 Turbo FP8 diffusion model", "kreaDiffusionModel", "diffusion_models", "The original Turbo FP8 file belongs in models/diffusion_models, not checkpoints.");
+    modelInput(fields, draft, "Krea 2 Qwen3-VL text encoder", "kreaTextEncoder", "text_encoders");
+    modelInput(fields, draft, "Krea 2 VAE", "kreaVae", "vae", "Usually qwen_image_vae.safetensors.");
+    modelInput(fields, draft, "Krea 2 Edit LoRA", "kreaEditLora", "loras", "The edit LoRA is applied before the source-latent patch.");
+    const grounding = input("number", draft.kreaGroundingPx ?? 768, { min: 0, max: 4096, step: 64 });
+    grounding.oninput = () => draft.kreaGroundingPx = Number(grounding.value);
+    fields.append(field("Krea grounding size", grounding, "Caps the longest source-image side sent through Qwen3-VL. 768 matches the edit workflow default."));
+    const mode = document.createElement("select");
+    mode.innerHTML = '<option value="reference-visual">Reference · four extras / visual cross-attention</option><option value="reference-role">Reference · two extras / role embedding</option>';
+    mode.value = draft.editAnythingMode || "reference-visual";
+    mode.onchange = () => draft.editAnythingMode = mode.value;
+    fields.append(field("EditAnything reference variant", mode, "Choose the variant that matches the standard/module LoRA pair."));
+    modelInput(fields, draft, "EditAnything standard LoRA", "editAnythingStandardLora", "loras", "Load this through the normal model LoRA path.");
+    modelInput(fields, draft, "EditAnything module LoRA", "editAnythingModuleLora", "loras", "A matching .module file loaded by BFSNodes.");
+    fields.insertAdjacentHTML("beforeend", '<div class="full form-help model-note">Krea image edit requires the local Krea2EditModelPatch and Krea2EditGroundedEncode custom nodes. EditAnything reference edit requires the local ComfyUI-BFSNodes EditAnything nodes. The editor never downloads or calls a hosted API.</div>');
+}
+
+function renderLoraSettings(root, draft) {
+    draft.loraLibrary ||= [];
+    root.innerHTML = `<h3>Generation LoRA library</h3><p>Define reusable local LoRAs, their model family, strength, and whether they are enabled by default. Every generation window lets you override the stack without changing these defaults.</p><div class="lora-library"></div><button class="button secondary add-lora">＋ Add LoRA</button><datalist id="lora-library-models"></datalist>`;
+    const datalist = $("#lora-library-models", root);
+    for (const model of state.backend.models.loras || []) datalist.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(model)}"></option>`);
+    const renderRows = () => {
+        const library = $(".lora-library", root);
+        library.innerHTML = draft.loraLibrary.length ? "" : '<div class="lora-library-empty">No reusable LoRAs yet.</div>';
+        draft.loraLibrary.forEach((lora) => {
+            const row = document.createElement("div");
+            row.className = "lora-library-row";
+            row.innerHTML = `<label><span>Name</span><input class="lora-name" type="text" value="${escapeHtml(lora.name || "")}" placeholder="Style LoRA"></label><label><span>Model</span><select class="lora-family"><option value="ltx">LTX 2.3</option><option value="krea">Krea 2</option></select></label><label class="lora-file"><span>Installed file</span><input type="text" list="lora-library-models" value="${escapeHtml(lora.file || "")}" placeholder="folder/model.safetensors"></label><label><span>Strength</span><input class="lora-strength" type="number" min="-10" max="10" step="0.05" value="${Number(lora.strength ?? 1)}"></label><label class="lora-default"><input type="checkbox" ${lora.default ? "checked" : ""}><span>Use by default</span></label><button class="small-icon remove-lora" title="Remove LoRA">×</button>`;
+            $(".lora-family", row).value = lora.family || "ltx";
+            $(".lora-name", row).oninput = (event) => lora.name = event.target.value;
+            $(".lora-family", row).onchange = (event) => lora.family = event.target.value;
+            $(".lora-file input", row).oninput = (event) => lora.file = event.target.value;
+            $(".lora-strength", row).oninput = (event) => lora.strength = Number(event.target.value);
+            $(".lora-default input", row).onchange = (event) => lora.default = event.target.checked;
+            $(".remove-lora", row).onclick = () => {
+                draft.loraLibrary = draft.loraLibrary.filter((item) => item.id !== lora.id);
+                renderRows();
+            };
+            library.append(row);
+        });
+    };
+    $(".add-lora", root).onclick = () => {
+        draft.loraLibrary.push({ id: uid("lora"), name: "", file: "", family: "ltx", strength: 1, default: false });
+        renderRows();
+    };
+    renderRows();
 }
 
 function renderProjectSettings(root, draft) {
@@ -2191,26 +2515,26 @@ function renderProjectSettings(root, draft) {
 }
 
 function renderWorkflowSettings(root, draft) {
-    root.innerHTML = `<h3>Advanced workflow overrides</h3><p>Inpaint, I2V, and SAM3 use bundled ComfyUI workflows. Paste API-format JSON here only when a model needs a custom graph. Reference edit requires an EditAnything workflow because IC-LoRA graph variants have different guide layouts.</p><div class="settings-fields"></div>`;
+    root.innerHTML = `<h3>Advanced workflow overrides</h3><p>Inpaint, I2V, SAM3, and Krea use local graphs. Paste API-format JSON here only when a model needs a custom graph. Reference edit uses a user-supplied EditAnything graph because its guide-video layout is model-specific.</p><div class="settings-fields"></div>`;
     const fields = $(".settings-fields", root);
     const imageEdit = textarea(draft.imageEditWorkflow || "", '{ "1": { "class_type": "LoadImage", "inputs": { "image": "{{source_image}}" } } }');
     imageEdit.className = "advanced-workflow";
     imageEdit.oninput = () => draft.imageEditWorkflow = imageEdit.value;
-    const imageField = field("Image edit API workflow (optional)", imageEdit, "Use {{source_image}}, {{prompt}}, {{seed}}, {{krea_checkpoint}}, and {{krea_text_encoder}} placeholders.");
+    const imageField = field("Image edit API workflow (optional)", imageEdit, "Use {{source_image}}, {{prompt}}, {{seed}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, and {{krea_edit_lora}} placeholders.");
     imageField.classList.add("full");
     fields.append(imageField);
     const refEdit = textarea(draft.refEditWorkflow || "", '{ "1": { "class_type": "LoadVideo", "inputs": { "file": "{{source_video}}" } } }');
     refEdit.className = "advanced-workflow";
     refEdit.oninput = () => draft.refEditWorkflow = refEdit.value;
-    const refField = field("EditAnything LTX 2.3 reference workflow", refEdit, "Use {{source_video}}, {{reference_image}}, {{prompt}}, {{seed}}, {{frame_count}}, {{edit_anything_lora}}, and any model placeholders listed below.");
+    const refField = field("EditAnything LTX 2.3 reference workflow", refEdit, "Use the matched standard/module LoRAs plus the three boolean EditAnything flag placeholders listed below.");
     refField.classList.add("full");
     fields.append(refField);
-    fields.insertAdjacentHTML("beforeend", `<div class="full form-help">Available placeholders: {{width}}, {{height}}, {{fps}}, {{duration}}, {{frame_count}}, {{ltx_checkpoint}}, {{ltx_distilled_lora}}, {{ltx_inpaint_lora}}, {{ltx_text_encoder}}, {{ltx_spatial_upscaler}}, {{sam_checkpoint}}, {{krea_checkpoint}}, {{krea_text_encoder}}, {{edit_anything_lora}}.</div>`);
+    fields.insertAdjacentHTML("beforeend", `<div class="full form-help">Available placeholders: {{source_video}}, {{reference_image}}, {{prompt}}, {{seed}}, {{width}}, {{height}}, {{fps}}, {{duration}}, {{frame_count}}, {{ltx_checkpoint}}, {{ltx_distilled_lora}}, {{ltx_inpaint_lora}}, {{ltx_text_encoder}}, {{ltx_spatial_upscaler}}, {{sam_checkpoint}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, {{krea_edit_lora}}, {{edit_anything_standard_lora}}, {{edit_anything_module_lora}}, {{edit_anything_enable_visual_crossattn}}, {{edit_anything_enable_role_embedding}}, {{edit_anything_enable_adaln}}.</div>`);
 }
 
 function openProjectMenu() {
     const modal = openModal("Project", state.project.name);
-    modal.body.innerHTML = `<div class="form-stack"><div class="clip-summary"><div class="clip-thumb">▶</div><div><strong>${escapeHtml(state.project.name)}</strong><span>${state.project.width}×${state.project.height} · ${state.project.fps} fps · ${formatClock(projectDuration())}</span></div></div><button class="button secondary rename">Rename sequence</button><button class="button secondary add-video">Add video track</button><button class="button secondary add-audio">Add audio track</button><button class="button secondary settings">Project settings</button><button class="button secondary export-json">Export edit list</button></div>`;
+    modal.body.innerHTML = `<div class="form-stack"><div class="clip-summary"><div class="clip-thumb">▶</div><div><strong>${escapeHtml(state.project.name)}</strong><span>${state.project.width}×${state.project.height} · ${state.project.fps} fps · ${formatClock(projectDuration())}</span></div></div><button class="button primary export-mp4">Export MP4</button><button class="button secondary rename">Rename sequence</button><button class="button secondary add-video">Add video track</button><button class="button secondary add-audio">Add audio track</button><button class="button secondary settings">Project settings</button><button class="button secondary export-json">Export edit list</button></div>`;
     $(".rename", modal.body).onclick = () => {
         const next = prompt("Sequence name", state.project.name);
         if (next?.trim()) { checkpoint(); state.project.name = next.trim(); renderAll(); closeModal(); }
@@ -2218,6 +2542,7 @@ function openProjectMenu() {
     $(".settings", modal.body).onclick = () => openSettings("project");
     $(".add-video", modal.body).onclick = () => { addTrack("video"); closeModal(); };
     $(".add-audio", modal.body).onclick = () => { addTrack("audio"); closeModal(); };
+    $(".export-mp4", modal.body).onclick = exportMp4;
     $(".export-json", modal.body).onclick = exportEditList;
     modalButton(modal, "Close", closeModal);
 }
@@ -2244,6 +2569,168 @@ function exportEditList() {
     link.download = `${state.project.name.replace(/[^a-z0-9_-]+/gi, "-") || "comfy-cut"}.json`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+function drawExportFrame(context, entries, time) {
+    context.fillStyle = "#050505";
+    context.fillRect(0, 0, context.canvas.width, context.canvas.height);
+    const active = entries.filter(({ clip }) => time >= clip.start && time < clip.start + clip.duration).sort((a, b) => b.trackIndex - a.trackIndex);
+    for (const { clip, element } of active) {
+        if (element.readyState < 2) continue;
+        const sourceTime = clip.sourceIn + time - clip.start;
+        if (Math.abs(element.currentTime - sourceTime) > .15) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration - .001));
+        if (element.paused) element.play().catch(() => {});
+        const transform = clip.transform || defaultTransform();
+        const sourceRatio = element.videoWidth / element.videoHeight;
+        const targetRatio = context.canvas.width / context.canvas.height;
+        let width;
+        let height;
+        if (sourceRatio > targetRatio) {
+            width = context.canvas.width * transform.scale / 100;
+            height = width / sourceRatio;
+        } else {
+            height = context.canvas.height * transform.scale / 100;
+            width = height * sourceRatio;
+        }
+        context.save();
+        context.globalAlpha = transform.opacity / 100;
+        context.translate(context.canvas.width / 2 + transform.x, context.canvas.height / 2 + transform.y);
+        context.rotate(transform.rotation * Math.PI / 180);
+        context.drawImage(element, -width / 2, -height / 2, width, height);
+        context.restore();
+    }
+    for (const entry of entries) {
+        if (!active.includes(entry) && !entry.element.paused) entry.element.pause();
+    }
+}
+
+function syncExportAudio(entries, time) {
+    for (const { clip, element } of entries) {
+        const active = time >= clip.start && time < clip.start + clip.duration;
+        if (!active) {
+            if (!element.paused) element.pause();
+            continue;
+        }
+        const sourceTime = clip.sourceIn + time - clip.start;
+        if (Math.abs(element.currentTime - sourceTime) > .15) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration - .001));
+        if (element.paused) element.play().catch(() => {});
+    }
+}
+
+async function exportMp4() {
+    const duration = sequenceDuration();
+    if (!duration) return toast("Nothing to export", "Add a clip to an enabled track first.", "error");
+    if (!state.backend.online) return toast("ComfyUI is offline", "Start ComfyUI before exporting MP4.", "error");
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return toast("Export is unavailable", "This browser cannot record the timeline canvas.", "error");
+    const modal = openModal("Export MP4", state.project.name);
+    modal.body.innerHTML = `<div class="job-progress"><span>Preparing timeline media…</span><div class="progress-track"><i></i></div></div><p class="form-help export-help">The editor renders the sequence once in real time, including enabled video and audio tracks, then ComfyUI encodes the recording as H.264 MP4.</p>`;
+    const label = $(".job-progress span", modal.body);
+    const bar = $(".job-progress i", modal.body);
+    let cancelled = false;
+    const cancel = modalButton(modal, "Cancel export", () => { cancelled = true; cancel.disabled = true; label.textContent = "Stopping export…"; });
+    const exportButton = $("#export-button");
+    exportButton.disabled = true;
+    let audioContext = null;
+    let stream = null;
+    const videoEntries = [];
+    const audioEntries = [];
+    try {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) {
+            audioContext = new AudioContextClass();
+            await audioContext.resume();
+        }
+        for (let trackIndex = 0; trackIndex < state.project.tracks.length; trackIndex++) {
+            const track = state.project.tracks[trackIndex];
+            if (!track.enabled) continue;
+            for (const clip of track.clips) {
+                const media = findMedia(clip.mediaId);
+                if (!media) continue;
+                const element = document.createElement(track.kind === "video" ? "video" : "audio");
+                element.src = media.url;
+                element.preload = "auto";
+                element.playsInline = true;
+                if (track.kind === "video") element.muted = true;
+                await waitFor(element, "loadeddata");
+                const firstFrame = clamp(clip.sourceIn, 0, Math.max(0, element.duration - .001));
+                if (Math.abs(element.currentTime - firstFrame) > .001) {
+                    element.currentTime = firstFrame;
+                    await waitFor(element, "seeked");
+                }
+                const entry = { clip, element, trackIndex };
+                if (track.kind === "video") videoEntries.push(entry);
+                else audioEntries.push(entry);
+            }
+        }
+        if (cancelled) return;
+        const canvas = document.createElement("canvas");
+        canvas.width = state.project.width;
+        canvas.height = state.project.height;
+        const context = canvas.getContext("2d");
+        stream = canvas.captureStream(state.project.fps);
+        if (audioContext && audioEntries.length) {
+            const destination = audioContext.createMediaStreamDestination();
+            for (const { element } of audioEntries) audioContext.createMediaElementSource(element).connect(destination);
+            for (const track of destination.stream.getAudioTracks()) stream.addTrack(track);
+        }
+        const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus") ? "video/webm;codecs=vp9,opus" : "video/webm";
+        const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 16_000_000 });
+        const chunks = [];
+        recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+        const finished = new Promise((resolve, reject) => {
+            recorder.onstop = resolve;
+            recorder.onerror = () => reject(new Error("The browser could not render this sequence"));
+        });
+        drawExportFrame(context, videoEntries, 0);
+        syncExportAudio(audioEntries, 0);
+        const started = performance.now();
+        recorder.start(500);
+        label.textContent = "Rendering timeline in real time…";
+        await new Promise((resolve) => {
+            const render = (now) => {
+                const time = Math.min(duration, (now - started) / 1000);
+                drawExportFrame(context, videoEntries, time);
+                syncExportAudio(audioEntries, time);
+                bar.style.width = `${Math.max(2, time / duration * 80)}%`;
+                if (cancelled || time >= duration) resolve();
+                else requestAnimationFrame(render);
+            };
+            requestAnimationFrame(render);
+        });
+        [...videoEntries, ...audioEntries].forEach(({ element }) => element.pause());
+        recorder.stop();
+        await finished;
+        if (cancelled) return;
+        label.textContent = "Sending local render to ComfyUI for MP4 encoding…";
+        bar.style.width = "82%";
+        const blob = new Blob(chunks, { type: mimeType });
+        const uploaded = await uploadBlob(blob, `comfy-cut-export-${Date.now()}.webm`);
+        const prompt = {
+            "1": { inputs: { file: annotatedResource(uploaded) }, class_type: "LoadVideo", _meta: { title: "Rendered sequence" } },
+            "2": { inputs: { video: ["1", 0], filename_prefix: "video/ComfyCut_export", format: "mp4", codec: "h264" }, class_type: "SaveVideo", _meta: { title: "Export MP4" } },
+        };
+        const generated = await runPrompt(prompt, { onProgress: (progress, text) => { if (progress != null) bar.style.width = `${82 + progress * 18}%`; if (text) label.textContent = text; } });
+        const resource = pickResource(generated.resources, "video");
+        if (!resource) throw new Error("ComfyUI finished without an MP4 output");
+        const link = document.createElement("a");
+        link.href = resourceUrl(resource);
+        link.download = `${state.project.name.replace(/[^a-z0-9_-]+/gi, "-") || "comfy-cut"}.mp4`;
+        link.click();
+        closeModal();
+        toast("MP4 exported", "The finished sequence was saved from ComfyUI.");
+    } catch (error) {
+        if (!cancelled) {
+            label.textContent = error.message;
+            bar.style.background = "var(--danger)";
+            toast("Export failed", error.message, "error");
+        }
+    } finally {
+        [...videoEntries, ...audioEntries].forEach(({ element }) => { element.pause(); element.removeAttribute("src"); });
+        stream?.getTracks().forEach((track) => track.stop());
+        await audioContext?.close();
+        exportButton.disabled = false;
+        if (cancelled) closeModal();
+    }
 }
 
 function openClipMenu() {
@@ -2282,7 +2769,18 @@ function bindEvents() {
     $("#play-button").onclick = togglePlay;
     $("#previous-frame").onclick = () => setPlayhead(state.playhead - 1 / state.project.fps);
     $("#next-frame").onclick = () => setPlayhead(state.playhead + 1 / state.project.fps);
+    $("#fit-button").onclick = () => {
+        state.previewZoom = null;
+        applyPreviewSize();
+    };
+    $("#canvas-wrap").onwheel = (event) => {
+        event.preventDefault();
+        const currentScale = previewCanvas.getBoundingClientRect().width / Math.max(1, previewCanvas.width);
+        state.previewZoom = clamp(currentScale * (event.deltaY < 0 ? 1.12 : .89), .03, 4);
+        applyPreviewSize();
+    };
     $("#settings-button").onclick = () => openSettings();
+    $("#export-button").onclick = exportMp4;
     $("#project-button").onclick = openProjectMenu;
     $("#clip-menu").onclick = openClipMenu;
     $("#backend-pill").onclick = checkBackend;
@@ -2300,13 +2798,15 @@ function bindEvents() {
         state.pixelsPerSecond = Number(event.target.value);
         renderTimeline();
     };
-    $("#ruler").onpointerdown = (event) => setPlayhead(pointerTime(event, $("#ruler")));
+    $("#ruler").onpointerdown = startTimelineScrub;
+    $("#playhead").onpointerdown = startTimelineScrub;
     $("#ai-tools").onclick = (event) => {
         const action = event.target.closest("button")?.dataset.action;
         if (!action) return;
         ({ sam: openSamMask, "simple-mask": openSimpleMask, inpaint: openInpaint, "image-edit": openImageEdit, i2v: openI2V, "ref-edit": openRefEdit })[action]?.();
     };
     document.addEventListener("keydown", handleKeyboard);
+    window.addEventListener("resize", applyPreviewSize);
     window.addEventListener("beforeunload", () => {
         for (const media of state.project.media) if (media.url?.startsWith("blob:")) URL.revokeObjectURL(media.url);
     });
