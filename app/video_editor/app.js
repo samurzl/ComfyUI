@@ -16,11 +16,11 @@ const defaultSettings = {
     kreaTextEncoder: "",
     kreaVae: "",
     kreaEditLora: "",
+    kreaGroundingMode: "auto",
     kreaGroundingPx: 768,
-    editAnythingMode: "reference-visual",
-    editAnythingStandardLora: "",
-    editAnythingModuleLora: "",
+    editAnythingLora: "",
     loraLibrary: [],
+    projectMegapixels: 2,
     projectWidth: 1920,
     projectHeight: 1080,
     projectFps: 30,
@@ -41,7 +41,7 @@ const state = {
         media: [],
     },
     settings: { ...defaultSettings, ...readSettings() },
-    backend: { online: false, models: {}, nodeTypes: new Set(), socket: null, jobs: new Map() },
+    backend: { online: false, models: {}, nodeTypes: new Set(), settingsLoaded: false, socket: null, jobs: new Map() },
     selectedClipId: null,
     tool: "select",
     linkMode: true,
@@ -50,6 +50,7 @@ const state = {
     playStartedAt: 0,
     playStartedFrom: 0,
     pixelsPerSecond: 90,
+    snapEnabled: true,
     previewZoom: null,
     clipboard: null,
     undo: [],
@@ -69,18 +70,83 @@ const runtimeRoot = $("#media-runtime");
 
 function readSettings() {
     try {
-        const settings = JSON.parse(localStorage.getItem("comfy-cut-settings") || "{}");
-        settings.loraLibrary = Array.isArray(settings.loraLibrary) ? settings.loraLibrary : [];
-        delete settings.kreaCheckpoint;
-        delete settings.editAnythingLora;
-        return settings;
+        return normalizeSettings(JSON.parse(localStorage.getItem("comfy-cut-settings") || "{}"));
     } catch {
         return {};
     }
 }
 
-function saveSettings() {
+function normalizeSettings(settings) {
+    settings.loraLibrary = Array.isArray(settings.loraLibrary) ? settings.loraLibrary : [];
+    settings.projectMegapixels ||= (Number(settings.projectWidth) || 1920) * (Number(settings.projectHeight) || 1080) / 1_000_000;
+    if (!settings.editAnythingLora && /edit_anything_v1\.1/i.test(settings.editAnythingStandardLora || "")) settings.editAnythingLora = settings.editAnythingStandardLora;
+    delete settings.kreaCheckpoint;
+    delete settings.editAnythingMode;
+    delete settings.editAnythingStandardLora;
+    delete settings.editAnythingModuleLora;
+    return settings;
+}
+
+function resolutionForMegapixels(megapixels, aspectRatio) {
+    const pixels = clamp(Number(megapixels) || 2, .1, 64) * 1_000_000;
+    const aspect = Number(aspectRatio) > 0 ? Number(aspectRatio) : 16 / 9;
+    let width = Math.max(64, Math.round(Math.sqrt(pixels * aspect) / 32) * 32);
+    let height = Math.max(64, Math.round(Math.sqrt(pixels / aspect) / 32) * 32);
+    const scale = Math.min(1, 8192 / width, 8192 / height);
+    width = Math.max(64, Math.round(width * scale / 32) * 32);
+    height = Math.max(64, Math.round(height * scale / 32) * 32);
+    return { width, height };
+}
+
+function projectAspectRatio() {
+    const source = state.project.media[0];
+    return source?.width && source?.height ? source.width / source.height : state.project.width / state.project.height;
+}
+
+function applyProjectMegapixels(megapixels, aspectRatio = projectAspectRatio()) {
+    const resolution = resolutionForMegapixels(megapixels, aspectRatio);
+    state.project.width = resolution.width;
+    state.project.height = resolution.height;
+    state.settings.projectMegapixels = clamp(Number(megapixels) || 2, .1, 64);
+    state.settings.projectWidth = resolution.width;
+    state.settings.projectHeight = resolution.height;
+}
+
+async function saveSettings() {
     localStorage.setItem("comfy-cut-settings", JSON.stringify(state.settings));
+    try {
+        const response = await apiFetch("/userdata/comfy-cut-settings.json?overwrite=true", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(state.settings),
+        });
+        return response.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function loadPersistedSettings() {
+    try {
+        const response = await apiFetch("/userdata/comfy-cut-settings.json", { cache: "no-store" });
+        if (response.status === 404) {
+            state.backend.settingsLoaded = true;
+            await saveSettings();
+            return;
+        }
+        if (!response.ok) return;
+        const saved = normalizeSettings(await response.json());
+        state.settings = { ...defaultSettings, ...saved };
+        state.project.width = Number(state.settings.projectWidth) || 1920;
+        state.project.height = Number(state.settings.projectHeight) || 1080;
+        state.project.fps = Number(state.settings.projectFps) || 30;
+        state.project.name = state.settings.projectName || state.project.name;
+        localStorage.setItem("comfy-cut-settings", JSON.stringify(state.settings));
+        state.backend.settingsLoaded = true;
+        renderAll();
+    } catch {
+        // Browser storage remains the fallback when user-data storage is unavailable.
+    }
 }
 
 function snapshot() {
@@ -184,7 +250,7 @@ function renderAll() {
 
 function updateViewerLabels() {
     $("#sequence-title").textContent = state.project.name;
-    $("#viewer-resolution").textContent = `${state.project.width} × ${state.project.height} · ${state.project.fps} fps`;
+    $("#viewer-resolution").textContent = `${state.project.width} × ${state.project.height} · ${(state.project.width * state.project.height / 1_000_000).toFixed(2)} MP · ${state.project.fps} fps`;
     $("#timeline-duration").textContent = formatClock(projectDuration());
     $("#timecode").textContent = formatClock(state.playhead, true);
     $("#viewer-empty").hidden = state.project.media.length > 0;
@@ -313,6 +379,35 @@ function startTimelineScrub(event) {
     target.addEventListener("pointercancel", up);
 }
 
+function clipEdgeTargets(excludedIds) {
+    return [0, ...state.project.tracks.flatMap((track) => track.clips.filter((clip) => !excludedIds.has(clip.id)).flatMap((clip) => [clip.start, clip.start + clip.duration]))];
+}
+
+function closestSnap(value, targets) {
+    if (!state.snapEnabled) return null;
+    const threshold = 10 / state.pixelsPerSecond;
+    let result = null;
+    for (const target of targets) {
+        const distance = Math.abs(target - value);
+        if (distance <= threshold && (!result || distance < result.distance)) result = { value: target, distance };
+    }
+    return result;
+}
+
+function snapClipStart(start, duration, targets) {
+    const startSnap = closestSnap(start, targets);
+    const endSnap = closestSnap(start + duration, targets);
+    if (!startSnap && !endSnap) return { start, guide: null };
+    if (!endSnap || (startSnap && startSnap.distance <= endSnap.distance)) return { start: startSnap.value, guide: startSnap.value };
+    return { start: endSnap.value - duration, guide: endSnap.value };
+}
+
+function showSnapGuide(time) {
+    const guide = $("#snap-guide");
+    guide.hidden = time == null;
+    if (time != null) guide.style.transform = `translateX(${time * state.pixelsPerSecond}px)`;
+}
+
 function startClipPointer(event, clip, track, element) {
     event.stopPropagation();
     selectClip(clip.id, false);
@@ -332,20 +427,26 @@ function startClipPointer(event, clip, track, element) {
     const originImages = structuredClone(clip.images || []);
     const linked = state.linkMode && clip.linkedId ? findClip(clip.linkedId)?.clip : null;
     const linkedOrigin = linked ? { start: linked.start, duration: linked.duration, sourceIn: linked.sourceIn } : null;
+    const snapTargets = clipEdgeTargets(new Set([clip.id, linked?.id].filter(Boolean)));
     let targetTrack = track;
     element.setPointerCapture(event.pointerId);
 
     const move = (moveEvent) => {
         const delta = roundFrame((moveEvent.clientX - originX) / state.pixelsPerSecond);
         if (mode === "move") {
-            clip.start = Math.max(0, originStart + delta);
+            const snapped = snapClipStart(Math.max(0, originStart + delta), clip.duration, snapTargets);
+            clip.start = Math.max(0, snapped.start);
+            showSnapGuide(snapped.guide);
             if (linked) linked.start = Math.max(0, linkedOrigin.start + (clip.start - originStart));
             const row = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY)?.closest(".track-row");
             const candidate = row ? findTrack(row.dataset.trackId) : null;
             if (candidate?.kind === track.kind) targetTrack = candidate;
             $$(".track-row").forEach((trackRow) => trackRow.classList.toggle("drop-target", trackRow.dataset.trackId === targetTrack.id && targetTrack !== track));
         } else if (mode === "trim-left") {
-            const applied = clamp(delta, -originSourceIn, originDuration - 1 / state.project.fps);
+            let applied = clamp(delta, -originSourceIn, originDuration - 1 / state.project.fps);
+            const snapped = closestSnap(originStart + applied, snapTargets);
+            if (snapped) applied = clamp(snapped.value - originStart, -originSourceIn, originDuration - 1 / state.project.fps);
+            showSnapGuide(snapped && originStart + applied === snapped.value ? snapped.value : null);
             clip.start = originStart + applied;
             clip.sourceIn = originSourceIn + applied;
             clip.duration = originDuration - applied;
@@ -355,7 +456,11 @@ function startClipPointer(event, clip, track, element) {
                 linked.duration = linkedOrigin.duration - applied;
             }
         } else {
-            clip.duration = clamp(originDuration + delta, 1 / state.project.fps, clip.sourceDuration - originSourceIn);
+            let duration = clamp(originDuration + delta, 1 / state.project.fps, clip.sourceDuration - originSourceIn);
+            const snapped = closestSnap(originStart + duration, snapTargets);
+            if (snapped) duration = clamp(snapped.value - originStart, 1 / state.project.fps, clip.sourceDuration - originSourceIn);
+            showSnapGuide(snapped && originStart + duration === snapped.value ? snapped.value : null);
+            clip.duration = duration;
             if (linked) linked.duration = clip.duration;
         }
         updateClipElement(element, clip);
@@ -372,6 +477,7 @@ function startClipPointer(event, clip, track, element) {
         element.removeEventListener("pointerup", up);
         element.removeEventListener("pointercancel", up);
         $$(".track-row").forEach((trackRow) => trackRow.classList.remove("drop-target"));
+        showSnapGuide(null);
         if (mode === "move" && targetTrack !== track) {
             track.clips = track.clips.filter((candidate) => candidate.id !== clip.id);
             targetTrack.clips.push(clip);
@@ -451,8 +557,7 @@ async function importVideo(file) {
     state.project.media.push(media);
     if (state.project.media.length === 1) {
         state.project.name = file.name.replace(/\.[^.]+$/, "");
-        state.project.width = media.width;
-        state.project.height = media.height;
+        applyProjectMegapixels(state.settings.projectMegapixels, media.width / media.height);
         insertMedia(media.id, 0, null, false);
     }
     renderAll();
@@ -826,15 +931,27 @@ function renderClipAssets(clip, track) {
 function updateAIButtons() {
     const result = selected();
     const videoClip = result?.track.kind === "video" ? result.clip : null;
+    const audioClip = result?.track.kind === "audio" ? result.clip : null;
     for (const button of $$("#ai-tools button")) {
+        const action = button.dataset.action;
+        if (action === "regenerate-video") {
+            button.disabled = !videoClip || !state.backend.online;
+            continue;
+        }
+        if (action === "regenerate-audio") {
+            button.disabled = !audioClip || !state.backend.online;
+            continue;
+        }
         const needsBackend = !["simple-mask"].includes(button.dataset.action);
         let disabled = !videoClip || (needsBackend && !state.backend.online);
         if (button.dataset.action === "inpaint" && videoClip && !hasMask(videoClip)) disabled = true;
-        if (["i2v", "ref-edit"].includes(button.dataset.action) && videoClip && !(videoClip.images || []).length) disabled = true;
+        if (button.dataset.action === "i2v" && videoClip && !(videoClip.images || []).length) disabled = true;
         button.disabled = disabled;
     }
     const help = $("#ai-help");
-    if (!videoClip) help.textContent = "Select a video clip to use AI tools.";
+    if (!result) help.textContent = "Select a video or audio clip to use AI tools.";
+    else if (audioClip && !state.backend.online) help.textContent = "ComfyUI is offline. Start it to regenerate audio.";
+    else if (audioClip) help.textContent = "Generate a new audio layer for this range from the composited timeline video, with adjustable context.";
     else if (!state.backend.online) help.textContent = "ComfyUI is offline. Simple masks remain available.";
     else if (!hasMask(videoClip)) help.textContent = "Create a mask to enable inpainting. Save an edited frame to enable I2V and reference edit.";
     else help.textContent = "AI tools are ready. Generated videos are placed on the first free track above this clip.";
@@ -901,6 +1018,7 @@ async function checkBackend() {
         pill.className = "backend-pill online";
         pill.innerHTML = "<i></i><span>ComfyUI connected</span>";
         connectSocket();
+        if (!state.backend.settingsLoaded) await loadPersistedSettings();
         if (!wasOnline) loadModelLists();
     } catch {
         state.backend.online = false;
@@ -1199,30 +1317,22 @@ function requireNodes(types, feature) {
 
 function configureEditAnythingWorkflow(prompt) {
     const nodes = Object.values(prompt);
-    const moduleEntry = Object.entries(prompt).find(([, node]) => node.class_type === "LTXVEditAnythingModuleLoader");
-    const moduleLoader = moduleEntry?.[1];
     const samplers = nodes.filter((node) => node.class_type === "LTXVEditAnythingLoopingSampler");
-    if (!moduleLoader || !samplers.length) throw new Error("The reference workflow must contain LTXVEditAnythingModuleLoader and LTXVEditAnythingLoopingSampler");
-    const standardLoaders = nodes.filter((node) => node.class_type === "LoraLoaderModelOnly" && ((node._meta?.title || "").toLowerCase().includes("editanything standard") || node.inputs.lora_name === state.settings.editAnythingStandardLora));
-    if (!standardLoaders.length) throw new Error("Name the standard LoRA loader ‘EditAnything standard’ or use {{edit_anything_standard_lora}} as its lora_name");
-    moduleLoader.inputs.module_name = state.settings.editAnythingModuleLora;
-    for (const loader of standardLoaders) loader.inputs.lora_name = state.settings.editAnythingStandardLora;
-    const visual = state.settings.editAnythingMode === "reference-visual";
+    if (!samplers.length) throw new Error("The workflow must contain LTXVEditAnythingLoopingSampler from ComfyUI-BFSNodes");
+    const loaders = nodes.filter((node) => node.class_type === "LoraLoaderModelOnly" && (/edit.?anything/i.test(node._meta?.title || "") || /edit_anything/i.test(node.inputs.lora_name || "")));
+    if (!loaders.length) throw new Error("Add a regular LoraLoaderModelOnly named ‘EditAnything v1.1’ or use {{edit_anything_lora}} as its lora_name");
+    for (const loader of loaders) loader.inputs.lora_name = state.settings.editAnythingLora;
+    for (const [id, node] of Object.entries(prompt)) if (node.class_type === "LTXVEditAnythingModuleLoader") delete prompt[id];
     for (const sampler of samplers) {
-        sampler.inputs.editanything_module = [moduleEntry[0], 0];
+        if (!Array.isArray(sampler.inputs.guide_frames)) throw new Error("Connect the source video frames to the Looping Sampler guide_frames input");
+        delete sampler.inputs.editanything_module;
+        delete sampler.inputs.ref_image;
         sampler.inputs.lora_name = "(none)";
         sampler.inputs.enable_ic_lora = true;
-        sampler.inputs.enable_adaln = true;
+        sampler.inputs.enable_adaln = false;
         sampler.inputs.reapply_per_chunk = true;
-        sampler.inputs.enable_visual_crossattn = visual;
-        sampler.inputs.enable_role_embedding = !visual;
-        if (visual) {
-            sampler.inputs.ref_context_scale = .01;
-            sampler.inputs.ref_token_scale = .25;
-            sampler.inputs.ref_start_block = 12;
-            sampler.inputs.ref_end_block = 35;
-            sampler.inputs.ref_init_from = "attn2";
-        }
+        sampler.inputs.enable_visual_crossattn = false;
+        sampler.inputs.enable_role_embedding = false;
     }
 }
 
@@ -1248,6 +1358,45 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
+    appendGenerationLoras(prompt, loras);
+    return prompt;
+}
+
+function promptNodeId(prompt, predicate) {
+    return Object.entries(prompt).find(([, node]) => predicate(node))?.[0];
+}
+
+async function buildTimelineRegenerationPrompt(videoReference, selectionStart, selectionDuration, contextBefore, contextAfter, promptText, seed, kind, loras = []) {
+    const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
+    const { prompt } = graphToPrompt(data.definitions.subgraphs[0]);
+    const fps = state.project.fps;
+    const selectionStartFrame = Math.max(0, Math.round(selectionStart * fps));
+    const selectionEndFrame = selectionStartFrame + Math.max(1, Math.round(selectionDuration * fps));
+    const timelineData = kind === "audio"
+        ? { mode: "inpaint", selection_start: selectionStartFrame, selection_end: selectionEndFrame, context_before: contextBefore, context_after: contextAfter, mask: {} }
+        : { mode: "regenerate", selection_start: selectionStartFrame, selection_end: selectionEndFrame, context_before: contextBefore, context_after: contextAfter };
+    setNodeInput(prompt, (node) => node.class_type === "LoadVideo", "file", annotatedResource(videoReference));
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify(timelineData));
+    setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
+    setNodeInput(prompt, nodeTitleIncludes("distilled lora"), "lora_name", state.settings.ltxDistilledLora);
+    setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
+    setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "text_encoder", state.settings.ltxTextEncoder);
+    setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "ckpt_name", state.settings.ltxCheckpoint);
+    setNodeInput(prompt, (node) => node.class_type === "LTXVAudioVAELoader", "ckpt_name", state.settings.ltxCheckpoint);
+    setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
+    setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
+    if (kind === "audio") {
+        setNodeInput(prompt, (node) => node.class_type === "LTXVAudioToAudioInplace", "bypass", true);
+        for (const [id, node] of Object.entries(prompt)) if (node.class_type === "SaveVideo") delete prompt[id];
+        const separateId = promptNodeId(prompt, (node) => node.class_type === "LTXVSeparateAVLatent");
+        const audioVaeId = promptNodeId(prompt, (node) => node.class_type === "LTXVAudioVAELoader");
+        const timelineId = promptNodeId(prompt, (node) => node.class_type === "VideoTimeline");
+        prompt["9100"] = { inputs: { samples: [separateId, 1], audio_vae: [audioVaeId, 0] }, class_type: "LTXVAudioVAEDecode", _meta: { title: "Decode regenerated audio" } };
+        prompt["9101"] = { inputs: { images: [timelineId, 0], audio: ["9100", 0], fps: [timelineId, 5] }, class_type: "CreateVideo", _meta: { title: "Composited video with regenerated audio" } };
+        prompt["9102"] = { inputs: { video: ["9101", 0], filename_prefix: "video/ComfyCut_regenerated_audio", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save regenerated audio" } };
+    } else {
+        setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_regenerated_video");
+    }
     appendGenerationLoras(prompt, loras);
     return prompt;
 }
@@ -1296,11 +1445,16 @@ function buildSamPrompt(videoReference, clip, promptText, options) {
     };
 }
 
+function kreaGroundingPixels(width, height, settings = state.settings) {
+    if (settings.kreaGroundingMode !== "manual") return Math.min(768, Math.max(width, height));
+    const grounding = Number(settings.kreaGroundingPx);
+    return Number.isFinite(grounding) ? clamp(grounding, 0, 4096) : 768;
+}
+
 function buildKreaImageEditPrompt(imageReference, promptText, seed, width, height, loras = []) {
-    const scale = Math.min(1, Math.sqrt(2_000_000 / Math.max(1, width * height)));
-    width = Math.max(64, Math.round(width * scale / 16) * 16);
-    height = Math.max(64, Math.round(height * scale / 16) * 16);
-    const groundingPx = Number.isFinite(Number(state.settings.kreaGroundingPx)) ? Number(state.settings.kreaGroundingPx) : 768;
+    width = Math.max(64, Math.round(width / 16) * 16);
+    height = Math.max(64, Math.round(height / 16) * 16);
+    const groundingPx = kreaGroundingPixels(width, height);
     const prompt = {
         "1": { inputs: { image: annotatedResource(imageReference) }, class_type: "LoadImage", _meta: { title: "Source frame" } },
         "2": { inputs: { image: ["1", 0], upscale_method: "area", width, height, crop: "disabled" }, class_type: "ImageScale", _meta: { title: "Match edit resolution" } },
@@ -1480,6 +1634,7 @@ async function openSimpleMask() {
     const samVideo = document.createElement("video");
     samVideo.muted = true;
     samVideo.preload = "auto";
+    let samTime = -1;
     const maskOverlay = document.createElement("canvas");
     const editor = await frameEditor(clip, canvas, (context, time) => {
         if (maskOverlay.width !== canvas.width || maskOverlay.height !== canvas.height) {
@@ -1488,7 +1643,7 @@ async function openSimpleMask() {
         }
         const maskContext = maskOverlay.getContext("2d", { willReadFrequently: true });
         maskContext.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-        if (samVideo.src && samVideo.readyState >= 2) {
+        if (samVideo.src && samVideo.readyState >= 2 && samTime === time) {
             maskContext.drawImage(samVideo, 0, 0, maskOverlay.width, maskOverlay.height);
             binarizeMask(maskOverlay);
             maskContext.globalCompositeOperation = "source-in";
@@ -1504,7 +1659,6 @@ async function openSimpleMask() {
         context.restore();
     });
     let requestedTime = 0;
-    let samTime = -1;
     let seeking = false;
     const seek = async (time) => {
         requestedTime = roundFrame(clamp(time, 0, Math.max(0, clip.duration - 1 / state.project.fps)));
@@ -1512,20 +1666,23 @@ async function openSimpleMask() {
         updateTimeline();
         if (seeking) return;
         seeking = true;
-        while (editor.time !== requestedTime || (samVideo.src && samTime !== requestedTime)) {
-            const target = requestedTime;
-            await editor.seek(target);
-            if (samVideo.src) {
-                const sourceTime = clamp((working.sam?.trimmed ? working.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, samVideo.duration - .001));
-                if (Math.abs(samVideo.currentTime - sourceTime) > .001) {
-                    samVideo.currentTime = sourceTime;
-                    await waitFor(samVideo, "seeked");
+        try {
+            while (editor.time !== requestedTime || (samVideo.src && samTime !== requestedTime)) {
+                const target = requestedTime;
+                await editor.seek(target);
+                if (samVideo.src) {
+                    const sourceTime = clamp((working.sam?.trimmed ? working.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, samVideo.duration - .001));
+                    if (Math.abs(samVideo.currentTime - sourceTime) > .001) {
+                        samVideo.currentTime = sourceTime;
+                        await waitFor(samVideo, "seeked");
+                    }
+                    samTime = target;
+                    editor.draw();
                 }
-                samTime = target;
-                editor.draw();
             }
+        } finally {
+            seeking = false;
         }
-        seeking = false;
     };
     if (working.sam?.url) {
         samVideo.src = working.sam.url;
@@ -1595,7 +1752,6 @@ async function openSimpleMask() {
             updateSelection();
             updateTimeline();
             seek(pointer);
-            editor.draw();
         };
         target.onpointerup = () => { target.onpointermove = null; target.onpointerup = null; };
     };
@@ -1715,6 +1871,7 @@ async function openSamMask() {
     let boxStart = null;
     let boxDraft = null;
     let stroke = null;
+    let overlayTime = -1;
     const maskOverlay = document.createElement("canvas");
     const editor = await frameEditor(clip, canvas, (context, time) => {
         if (maskOverlay.width !== canvas.width || maskOverlay.height !== canvas.height) {
@@ -1723,7 +1880,7 @@ async function openSamMask() {
         }
         const maskContext = maskOverlay.getContext("2d", { willReadFrequently: true });
         maskContext.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-        if (overlayVideo.src && overlayVideo.readyState >= 2) {
+        if (overlayVideo.src && overlayVideo.readyState >= 2 && overlayTime === time) {
             maskContext.drawImage(overlayVideo, 0, 0, maskOverlay.width, maskOverlay.height);
             binarizeMask(maskOverlay);
             maskContext.globalCompositeOperation = "source-in";
@@ -1746,12 +1903,30 @@ async function openSamMask() {
         context.restore();
     });
 
+    let requestedTime = 0;
+    let seeking = false;
     const seekBoth = async (time) => {
-        await editor.seek(time);
-        if (!overlayVideo.src) return;
-        overlayVideo.currentTime = clamp((existing.sam?.trimmed ? existing.sam.offset || 0 : clip.sourceIn) + time, 0, Math.max(0, overlayVideo.duration - .001));
-        await waitFor(overlayVideo, "seeked");
-        editor.draw();
+        requestedTime = roundFrame(clamp(time, 0, Math.max(0, clip.duration - 1 / state.project.fps)));
+        $(".frame-scrub", modal.body).value = requestedTime;
+        if (seeking) return;
+        seeking = true;
+        try {
+            while (editor.time !== requestedTime || (overlayVideo.src && overlayTime !== requestedTime)) {
+                const target = requestedTime;
+                await editor.seek(target);
+                if (overlayVideo.src) {
+                    const sourceTime = clamp((existing.sam?.trimmed ? existing.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, overlayVideo.duration - .001));
+                    if (Math.abs(overlayVideo.currentTime - sourceTime) > .001) {
+                        overlayVideo.currentTime = sourceTime;
+                        await waitFor(overlayVideo, "seeked");
+                    }
+                    overlayTime = target;
+                    editor.draw();
+                }
+            }
+        } finally {
+            seeking = false;
+        }
     };
     if (existing.sam?.url) {
         overlayVideo.src = existing.sam.url;
@@ -1831,6 +2006,7 @@ async function openSamMask() {
             const resource = pickResource(result.resources, "video");
             if (!resource) throw new Error("SAM3 finished without a mask video output");
             overlayVideo.src = resourceUrl(resource);
+            overlayTime = -1;
             await waitFor(overlayVideo, "loadedmetadata");
             existing.sam = { prompt: promptText, ...options, threshold: Number($(".sam-threshold", modal.body).value), refine: Number($(".sam-refine", modal.body).value), resource, url: resourceUrl(resource), trimmed: true, offset: 0 };
             await seekBoth(editor.time);
@@ -1921,7 +2097,7 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
         maskVideo.src = clip.mask.sam.url;
         maskVideo.muted = true;
         maskVideo.preload = "auto";
-        await waitFor(maskVideo, "loadedmetadata");
+        await waitFor(maskVideo, "loadeddata");
     }
     const frames = [];
     const firstFrame = Math.round(clip.sourceIn * state.project.fps);
@@ -1931,8 +2107,11 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
         maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         if (maskVideo.src) {
             const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
-            maskVideo.currentTime = clamp((clip.mask.sam?.trimmed ? clip.mask.sam.offset || 0 : sourceIn) + time, 0, Math.max(0, maskVideo.duration - .001));
-            await waitFor(maskVideo, "seeked");
+            const target = clamp((clip.mask.sam?.trimmed ? clip.mask.sam.offset || 0 : sourceIn) + time, 0, Math.max(0, maskVideo.duration - .001));
+            if (Math.abs(maskVideo.currentTime - target) > .001) {
+                maskVideo.currentTime = target;
+                await waitFor(maskVideo, "seeked");
+            }
             maskContext.drawImage(maskVideo, 0, 0, maskCanvas.width, maskCanvas.height);
             binarizeMask(maskCanvas);
         }
@@ -2005,7 +2184,7 @@ function binarizeMask(canvas) {
     context.putImageData(image, 0, 0);
 }
 
-async function bakeClip(clip, onProgress = () => {}) {
+async function bakeClip(clip, onProgress = () => {}, includeTransform = true) {
     if (!window.MediaRecorder) throw new Error("This browser cannot bake transformed video clips");
     const media = findMedia(clip.mediaId);
     const video = document.createElement("video");
@@ -2041,7 +2220,7 @@ async function bakeClip(clip, onProgress = () => {}) {
         recorder.onstop = resolve;
         recorder.onerror = () => reject(new Error("Could not render the transformed clip"));
     });
-    const transform = clip.transform || defaultTransform();
+    const transform = includeTransform ? clip.transform || defaultTransform() : defaultTransform();
     const started = performance.now();
     recorder.start(500);
     await video.play();
@@ -2067,7 +2246,7 @@ async function bakeClip(clip, onProgress = () => {}) {
             context.rotate(transform.rotation * Math.PI / 180);
             context.drawImage(video, -width / 2, -height / 2, width, height);
             context.restore();
-            onProgress(clamp(elapsed / clip.duration, 0, .99), "Baking clip transforms in real time…");
+            onProgress(clamp(elapsed / clip.duration, 0, .99), includeTransform ? "Baking clip transforms in real time…" : "Scaling clip to the project resolution in real time…");
             if (elapsed >= clip.duration || video.currentTime >= clip.sourceIn + clip.duration) resolve();
             else requestAnimationFrame(draw);
         };
@@ -2082,7 +2261,7 @@ async function bakeClip(clip, onProgress = () => {}) {
     const uploaded = await uploadBlob(blob, `transformed-${Date.now()}.webm`);
     onProgress(1, "Transformed clip ready");
     const temporaryMedia = { id: uid("render"), name: "Transformed clip", url: URL.createObjectURL(blob), file: blob, uploaded, serverRef: uploaded, duration: clip.duration, width: state.project.width, height: state.project.height };
-    const temporaryClip = { ...structuredClone(clip), mediaId: temporaryMedia.id, sourceIn: 0, sourceDuration: clip.duration, transform: defaultTransform(), maskSource: { mediaId: clip.mediaId, sourceIn: clip.sourceIn, transform: structuredClone(clip.transform || defaultTransform()) } };
+    const temporaryClip = { ...structuredClone(clip), mediaId: temporaryMedia.id, sourceIn: 0, sourceDuration: clip.duration, transform: defaultTransform(), maskSource: { mediaId: clip.mediaId, sourceIn: clip.sourceIn, transform: structuredClone(transform) } };
     state.project.media.push(temporaryMedia);
     return { clip: temporaryClip, media: temporaryMedia, cleanup: () => {
         state.project.media = state.project.media.filter((item) => item.id !== temporaryMedia.id);
@@ -2090,12 +2269,66 @@ async function bakeClip(clip, onProgress = () => {}) {
     } };
 }
 
+async function openTimelineRegeneration(kind) {
+    const result = selected();
+    if (!result || result.track.kind !== kind || !state.backend.online) return;
+    const clip = result.clip;
+    const title = kind === "audio" ? "Generate audio layer" : "Regenerate video";
+    const modal = openModal(title, clip.name, "wide");
+    modal.body.innerHTML = `<div class="modal-grid"><div class="generation-preview result-preview"><span class="generation-empty">The enabled video tracks will be composited across this clip and its context.</span></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="${kind === "audio" ? "Describe the desired dialogue, ambience, music, and sound effects" : "Describe what should happen in the regenerated video interval"}"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" min="0" max="9007199254740991" value="${randomSeed()}"></label><div class="context-fields"><label class="form-field"><span>Context before</span><span class="field-with-unit"><input class="context-before" type="number" min="0" max="30" step="0.1" value="1"><i>s</i></span></label><label class="form-field"><span>Context after</span><span class="field-with-unit"><input class="context-after" type="number" min="0" max="30" step="0.1" value="1"><i>s</i></span></label></div><small class="form-help">Context is generated with the selected interval so motion and sound can flow across both boundaries. Only the selected clip duration is placed on the timeline.${kind === "audio" ? " The original audio remains untouched; this result is added on another audio track." : ""}</small><button class="button primary generate">Generate ${kind}</button><div class="job-slot"></div></div></div>`;
+    const controls = $(".form-stack", modal.body);
+    const selectedLoras = generationLoraPicker(controls, "ltx");
+    const preview = $(".result-preview", modal.body);
+    const generate = $(".generate", modal.body);
+    let output = null;
+    let generatedSourceIn = 0;
+    generate.onclick = async () => {
+        const promptText = $(".prompt", modal.body).value.trim();
+        if (!promptText) return toast(`Add a ${kind} prompt`, `Describe the ${kind} you want LTX to generate.`, "error");
+        const contextBefore = clamp(Number($(".context-before", modal.body).value) || 0, 0, 30);
+        const contextAfter = clamp(Number($(".context-after", modal.body).value) || 0, 0, 30);
+        const rangeStart = Math.max(0, clip.start - contextBefore);
+        const actualBefore = clip.start - rangeStart;
+        const layoutPadding = 16 / state.project.fps;
+        const rangeEnd = clip.start + clip.duration + contextAfter + layoutPadding;
+        const job = generationStatus($(".job-slot", modal.body));
+        generate.disabled = true;
+        output = null;
+        try {
+            const compositeVideo = await renderCompositeRange(rangeStart, rangeEnd, job.callbacks.onProgress);
+            const uploaded = await uploadBlob(compositeVideo, `composited-${kind}-${Date.now()}.webm`);
+            job.callbacks.onProgress(.38, "Preparing LTX timeline regeneration…");
+            const prompt = await buildTimelineRegenerationPrompt(uploaded, actualBefore, clip.duration, actualBefore, contextAfter, promptText, Number($(".seed", modal.body).value), kind, selectedLoras());
+            const generated = await runPrompt(prompt, {
+                ...job.callbacks,
+                onProgress: (progress, text) => job.callbacks.onProgress(progress == null ? null : .4 + progress * .6, text),
+            });
+            const resource = pickResource(generated.resources, "video");
+            if (!resource) throw new Error(`LTX completed without a regenerated ${kind} output`);
+            output = resource;
+            generatedSourceIn = actualBefore;
+            showJobVideo(preview, resourceUrl(resource), generatedSourceIn, clip.duration);
+            job.complete(kind === "audio" ? "New audio layer ready" : "Video regeneration ready");
+        } catch (error) {
+            job.fail(error);
+        } finally {
+            generate.disabled = false;
+        }
+    };
+    modalButton(modal, "Cancel", closeModal);
+    modalButton(modal, "Save to timeline", async () => {
+        if (!output) return toast(`Generate ${kind} first`, "Preview a result before saving it.", "error");
+        await addGeneratedClip(output, clip, generatedSourceIn, title, kind);
+        closeModal();
+    }, "primary");
+}
+
 async function openInpaint() {
     const result = selected();
     if (!result || result.track.kind !== "video" || !hasMask(result.clip)) return;
     const sourceClip = result.clip;
     const modal = openModal("Inpaint", sourceClip.name, "wide");
-    modal.body.innerHTML = `<div class="modal-grid"><div class="generation-preview"><video class="source-preview" src="${escapeHtml(findMedia(sourceClip.mediaId).url)}" controls></video><span class="generation-empty" hidden></span></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe what should replace the masked area"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" min="0" max="9007199254740991" value="${randomSeed()}"></label><label class="toggle-row"><span>Use clip scale, position, and rotation</span><input class="use-transform" type="checkbox"></label><small class="form-help">When enabled, the transform is baked before generation. Empty canvas areas become outpainting regions. Baking takes the clip's duration in real time.</small><button class="button primary generate">Generate</button><div class="job-slot"></div></div></div>`;
+    modal.body.innerHTML = `<div class="modal-grid"><div class="generation-preview"><video class="source-preview" src="${escapeHtml(findMedia(sourceClip.mediaId).url)}" controls></video><span class="generation-empty" hidden></span></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe what should replace the masked area"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" min="0" max="9007199254740991" value="${randomSeed()}"></label><label class="toggle-row"><span>Use clip scale, position, and rotation</span><input class="use-transform" type="checkbox"></label><small class="form-help">Generation always uses the project megapixel resolution. Enable transforms to bake scale, position, and rotation too; empty canvas areas then become outpainting regions.</small><button class="button primary generate">Generate</button><div class="job-slot"></div></div></div>`;
     const sourceVideo = $(".source-preview", modal.body);
     const selectedLoras = generationLoraPicker($(".form-stack", modal.body), "ltx");
     sourceVideo.currentTime = sourceClip.sourceIn;
@@ -2113,8 +2346,9 @@ async function openInpaint() {
         try {
             const useTransform = $(".use-transform", modal.body).checked;
             let clip = sourceClip;
-            if (useTransform) {
-                baked = await bakeClip(sourceClip, job.callbacks.onProgress);
+            const sourceMedia = findMedia(sourceClip.mediaId);
+            if (useTransform || sourceMedia.width !== state.project.width || sourceMedia.height !== state.project.height) {
+                baked = await bakeClip(sourceClip, job.callbacks.onProgress, useTransform);
                 clip = baked.clip;
                 clip.mask = structuredClone(sourceClip.mask);
                 generatedSourceIn = 0;
@@ -2175,7 +2409,7 @@ function showJobVideo(preview, url, start = 0, duration = null) {
     };
 }
 
-async function addGeneratedClip(resource, sourceClip, sourceIn, label) {
+async function addGeneratedClip(resource, sourceClip, sourceIn, label, kind = "video") {
     const url = resourceUrl(resource);
     const video = document.createElement("video");
     video.src = url;
@@ -2199,25 +2433,30 @@ async function addGeneratedClip(resource, sourceClip, sourceIn, label) {
     const original = findClip(sourceClip.id);
     const originalIndex = state.project.tracks.findIndex((track) => track.id === original?.track.id);
     let target = null;
-    for (let index = originalIndex - 1; index >= 0; index--) {
+    const indexes = kind === "video"
+        ? Array.from({ length: Math.max(0, originalIndex) }, (_, offset) => originalIndex - offset - 1)
+        : Array.from({ length: Math.max(0, state.project.tracks.length - originalIndex - 1) }, (_, offset) => originalIndex + offset + 1);
+    for (const index of indexes) {
         const candidate = state.project.tracks[index];
-        if (candidate.kind === "video" && !candidate.clips.some((clip) => rangesOverlap(clip.start, clip.start + clip.duration, sourceClip.start, sourceClip.start + sourceClip.duration))) {
+        if (candidate.kind === kind && !candidate.clips.some((clip) => rangesOverlap(clip.start, clip.start + clip.duration, sourceClip.start, sourceClip.start + sourceClip.duration))) {
             target = candidate;
             break;
         }
     }
     if (!target) {
-        target = { id: uid("track"), kind: "video", name: `Video ${state.project.tracks.filter((track) => track.kind === "video").length + 1}`, enabled: true, clips: [] };
-        state.project.tracks.unshift(target);
+        const name = `${kind === "video" ? "Video" : "Audio"} ${state.project.tracks.filter((track) => track.kind === kind).length + 1}`;
+        target = { id: uid("track"), kind, name, enabled: true, clips: [] };
+        if (kind === "video") state.project.tracks.unshift(target);
+        else state.project.tracks.push(target);
     }
     const clip = {
         id: uid("clip"), mediaId: media.id, name: media.name, start: sourceClip.start, duration: sourceClip.duration,
-        sourceIn, sourceDuration: media.duration, linkedId: null, transform: defaultTransform(), mask: null, images: [], generated: true,
+        sourceIn, sourceDuration: media.duration, linkedId: null, transform: kind === "video" ? defaultTransform() : null, mask: null, images: [], generated: true,
     };
     target.clips.push(clip);
     state.selectedClipId = clip.id;
     renderAll();
-    toast("Added to timeline", `${label} was placed above the source clip.`);
+    toast("Added to timeline", kind === "video" ? `${label} was placed above the source clip.` : `${label} was placed on a free audio track.`);
 }
 
 function rangesOverlap(startA, endA, startB, endB) {
@@ -2230,7 +2469,7 @@ async function openImageEdit() {
     const clip = result.clip;
     const media = findMedia(clip.mediaId);
     const modal = openModal("Image edit", clip.name, "wide");
-    modal.body.innerHTML = `<div class="modal-grid"><div><div class="generation-preview frame-preview"><canvas></canvas></div><input class="frame-scrub" type="range" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0" style="width:100%;accent-color:var(--accent);margin-top:10px"><div class="generation-preview result-preview" hidden></div></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe how this frame should change"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" value="${randomSeed()}"></label><button class="button primary generate">Generate with Krea 2 Edit</button><div class="job-slot"></div></div></div>`;
+    modal.body.innerHTML = `<div class="modal-grid"><div><div class="generation-preview frame-preview"><canvas></canvas></div><input class="frame-scrub" type="range" min="0" max="${clip.duration}" step="${1 / state.project.fps}" value="0" style="width:100%;accent-color:var(--accent);margin-top:10px"><div class="generation-preview result-preview" hidden></div></div><div class="form-stack"><label class="form-field"><span>Prompt</span><textarea class="prompt" placeholder="Describe how this frame should change"></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" value="${randomSeed()}"></label><small class="form-help">Output: ${state.project.width} × ${state.project.height} · grounding: ${kreaGroundingPixels(state.project.width, state.project.height)} px${state.settings.kreaGroundingMode === "manual" ? " manual" : " automatic"}.</small><button class="button primary generate">Generate with Krea 2 Edit</button><div class="job-slot"></div></div></div>`;
     const canvas = $("canvas", modal.body);
     const editor = await frameEditor(clip, canvas);
     const selectedLoras = generationLoraPicker($(".form-stack", modal.body), "krea");
@@ -2254,7 +2493,7 @@ async function openImageEdit() {
                 appendGenerationLoras(workflow, loras);
             } else {
                 requireNodes(["Krea2EditModelPatch", "Krea2EditGroundedEncode"], "Krea 2 image edit");
-                workflow = buildKreaImageEditPrompt(reference, promptText, values.seed, media.width, media.height, loras);
+                workflow = buildKreaImageEditPrompt(reference, promptText, values.seed, state.project.width, state.project.height, loras);
             }
             const generated = await runPrompt(workflow, job.callbacks);
             const resource = pickResource(generated.resources, "image");
@@ -2276,7 +2515,7 @@ async function openImageEdit() {
         clip.images.push({ id: uid("image"), name: `Krea edit ${clip.images.length + 1}`, url: output.url, resource: output.resource, sourceTime: output.time });
         closeModal();
         renderAll();
-        toast("Image attached", "It is now available for image-to-video and reference edit.");
+        toast("Image attached", "It is now available for image-to-video generation.");
     }, "primary");
 }
 
@@ -2302,11 +2541,8 @@ function workflowValues({ clip, prompt, seed, sourceImage, referenceImage, sourc
         krea_text_encoder: state.settings.kreaTextEncoder,
         krea_vae: state.settings.kreaVae,
         krea_edit_lora: state.settings.kreaEditLora,
-        edit_anything_standard_lora: state.settings.editAnythingStandardLora,
-        edit_anything_module_lora: state.settings.editAnythingModuleLora,
-        edit_anything_enable_visual_crossattn: state.settings.editAnythingMode === "reference-visual",
-        edit_anything_enable_role_embedding: state.settings.editAnythingMode === "reference-role",
-        edit_anything_enable_adaln: true,
+        krea_grounding_px: kreaGroundingPixels(state.project.width, state.project.height),
+        edit_anything_lora: state.settings.editAnythingLora,
         sam_checkpoint: state.settings.samCheckpoint,
     };
 }
@@ -2367,38 +2603,60 @@ async function openI2V() {
     });
 }
 
-async function openRefEdit() {
+async function openEditAnything() {
     const result = selected();
-    if (!result || result.track.kind !== "video" || !result.clip.images?.length) return;
+    if (!result || result.track.kind !== "video") return;
     const clip = result.clip;
-    if (!state.settings.editAnythingStandardLora || !state.settings.editAnythingModuleLora) {
-        toast("Complete the EditAnything setup", "Select a matched standard and module LoRA pair in Settings → Models.", "error");
+    if (!state.settings.editAnythingLora) {
+        toast("Complete the EditAnything setup", "Select edit_anything_v1.1_r256.safetensors in Settings → Models.", "error");
         openSettings("models");
         return;
     }
     try {
-        requireNodes(["LTXVEditAnythingModuleLoader", "LTXVEditAnythingLoopingSampler"], "EditAnything reference edit");
+        requireNodes(["LTXVEditAnythingLoopingSampler"], "EditAnything v1.1");
     } catch (error) {
         toast("EditAnything nodes are missing", error.message, "error");
         return;
     }
     if (!state.settings.refEditWorkflow.trim()) {
-        toast("Reference workflow needed", "Add an EditAnything LTX 2.3 API workflow in Settings → Workflows.", "error");
+        toast("EditAnything workflow needed", "Add an EditAnything v1.1 API workflow in Settings → Workflows.", "error");
         openSettings("workflows");
         return;
     }
-    await chooseAttachedImage(clip, "Reference edit", "ltx", async (image, promptText, seed, job, loras) => {
-        const media = findMedia(clip.mediaId);
-        const sourceVideo = await ensureMediaUploaded(media);
-        const values = workflowValues({ clip, prompt: promptText, seed, sourceVideo, referenceImage: image.resource });
-        const workflow = customWorkflow(state.settings.refEditWorkflow, values);
-        configureEditAnythingWorkflow(workflow);
-        appendGenerationLoras(workflow, loras);
-        const generated = await runPrompt(workflow, job.callbacks);
-        const resource = pickResource(generated.resources, "video");
-        if (!resource) throw new Error("The reference edit workflow completed without a video output");
-        return resource;
-    });
+    const modal = openModal("EditAnything v1.1", clip.name, "wide");
+    modal.body.innerHTML = `<div class="modal-grid"><div class="generation-preview result-preview"><span class="generation-empty">The selected clip will be scaled to the project resolution and used as the guide video.</span></div><div class="form-stack"><label class="form-field"><span>Edit instruction</span><textarea class="prompt" placeholder="Replace the blue robot on the left with a smiling man wearing sunglasses."></textarea></label><label class="form-field"><span>Seed</span><input class="seed" type="number" min="0" max="9007199254740991" value="${randomSeed()}"></label><small class="form-help">v1.1 is prompt-only: no attached reference image or module file is used. Use one imperative Add, Remove, Replace, or Style instruction.</small><button class="button primary generate">Generate edit</button><div class="job-slot"></div></div></div>`;
+    const controls = $(".form-stack", modal.body);
+    const selectedLoras = generationLoraPicker(controls, "ltx");
+    const preview = $(".result-preview", modal.body);
+    let output = null;
+    $(".generate", controls).onclick = async () => {
+        const promptText = $(".prompt", controls).value.trim();
+        if (!promptText) return toast("Add an edit instruction", "Describe one Add, Remove, Replace, or Style edit.", "error");
+        const job = generationStatus($(".job-slot", controls));
+        let baked = null;
+        try {
+            baked = await bakeClip(clip, job.callbacks.onProgress, false);
+            const values = workflowValues({ clip: baked.clip, prompt: promptText, seed: Number($(".seed", controls).value), sourceVideo: baked.media.uploaded });
+            const workflow = customWorkflow(state.settings.refEditWorkflow, values);
+            configureEditAnythingWorkflow(workflow);
+            appendGenerationLoras(workflow, selectedLoras());
+            const generated = await runPrompt(workflow, job.callbacks);
+            output = pickResource(generated.resources, "video");
+            if (!output) throw new Error("The EditAnything workflow completed without a video output");
+            showJobVideo(preview, resourceUrl(output), 0, clip.duration);
+            job.complete("EditAnything result ready");
+        } catch (error) {
+            job.fail(error);
+        } finally {
+            baked?.cleanup();
+        }
+    };
+    modalButton(modal, "Cancel", closeModal);
+    modalButton(modal, "Save to timeline", async () => {
+        if (!output) return toast("Generate an edit first", "Preview a result before saving it.", "error");
+        await addGeneratedClip(output, clip, 0, "EditAnything v1.1");
+        closeModal();
+    }, "primary");
 }
 
 function openSettings(initialPage = "models") {
@@ -2417,16 +2675,15 @@ function openSettings(initialPage = "models") {
     };
     $$('[data-page]', modal.body).forEach((button) => button.onclick = () => renderPage(button.dataset.page));
     modalButton(modal, "Cancel", closeModal);
-    modalButton(modal, "Save settings", () => {
+    modalButton(modal, "Save settings", async () => {
         state.settings = draft;
-        state.project.width = clamp(Number(draft.projectWidth) || 1920, 64, 8192);
-        state.project.height = clamp(Number(draft.projectHeight) || 1080, 64, 8192);
+        applyProjectMegapixels(draft.projectMegapixels);
         state.project.fps = clamp(Number(draft.projectFps) || 30, 1, 120);
         state.project.name = draft.projectName || "Untitled sequence";
-        saveSettings();
+        const savedToComfyUI = await saveSettings();
         closeModal();
         renderAll();
-        toast("Settings saved", "New AI jobs will use the selected models.");
+        toast("Settings saved", savedToComfyUI ? "Stored in ComfyUI user data for future restarts." : "Stored in this browser; ComfyUI user-data storage was unavailable.");
     }, "primary");
     renderPage(initialPage);
 }
@@ -2454,17 +2711,21 @@ function renderModelSettings(root, draft) {
     modelInput(fields, draft, "Krea 2 Qwen3-VL text encoder", "kreaTextEncoder", "text_encoders");
     modelInput(fields, draft, "Krea 2 VAE", "kreaVae", "vae", "Usually qwen_image_vae.safetensors.");
     modelInput(fields, draft, "Krea 2 Edit LoRA", "kreaEditLora", "loras", "The edit LoRA is applied before the source-latent patch.");
+    const groundingMode = document.createElement("select");
+    groundingMode.innerHTML = '<option value="auto">Automatic · source-aware 768 px cap</option><option value="manual">Manual override</option>';
+    groundingMode.value = draft.kreaGroundingMode || "auto";
     const grounding = input("number", draft.kreaGroundingPx ?? 768, { min: 0, max: 4096, step: 64 });
     grounding.oninput = () => draft.kreaGroundingPx = Number(grounding.value);
-    fields.append(field("Krea grounding size", grounding, "Caps the longest source-image side sent through Qwen3-VL. 768 matches the edit workflow default."));
-    const mode = document.createElement("select");
-    mode.innerHTML = '<option value="reference-visual">Reference · four extras / visual cross-attention</option><option value="reference-role">Reference · two extras / role embedding</option>';
-    mode.value = draft.editAnythingMode || "reference-visual";
-    mode.onchange = () => draft.editAnythingMode = mode.value;
-    fields.append(field("EditAnything reference variant", mode, "Choose the variant that matches the standard/module LoRA pair."));
-    modelInput(fields, draft, "EditAnything standard LoRA", "editAnythingStandardLora", "loras", "Load this through the normal model LoRA path.");
-    modelInput(fields, draft, "EditAnything module LoRA", "editAnythingModuleLora", "loras", "A matching .module file loaded by BFSNodes.");
-    fields.insertAdjacentHTML("beforeend", '<div class="full form-help model-note">Krea image edit requires the local Krea2EditModelPatch and Krea2EditGroundedEncode custom nodes. EditAnything reference edit requires the local ComfyUI-BFSNodes EditAnything nodes. The editor never downloads or calls a hosted API.</div>');
+    const updateGrounding = () => {
+        draft.kreaGroundingMode = groundingMode.value;
+        grounding.disabled = groundingMode.value !== "manual";
+    };
+    groundingMode.onchange = updateGrounding;
+    fields.append(field("Krea grounding", groundingMode, `Automatic uses ${kreaGroundingPixels(draft.projectWidth || state.project.width, draft.projectHeight || state.project.height, { ...draft, kreaGroundingMode: "auto" })} px for this project. This controls Qwen3-VL semantic detail, not output resolution.`));
+    fields.append(field("Manual grounding pixels", grounding, "Lower values strengthen broad edits; higher values favor identity detail but can duplicate subjects. v1.1 was trained mostly at 384–768 px; 0 keeps the input's native size."));
+    modelInput(fields, draft, "EditAnything v1.1 LoRA", "editAnythingLora", "loras", "Use edit_anything_v1.1_r256.safetensors. It is a normal prompt-only LoRA with no .module companion.");
+    fields.insertAdjacentHTML("beforeend", '<div class="full form-help model-note"><strong>Required custom nodes:</strong> Krea image edit needs <a href="https://github.com/lbouaraba/comfyui-krea2edit" target="_blank" rel="noreferrer">ComfyUI-Krea2Edit</a>. EditAnything v1.1 needs the Looping Sampler from <a href="https://github.com/alisson-anjos/ComfyUI-BFSNodes" target="_blank" rel="noreferrer">ComfyUI-BFSNodes</a>. Download <strong>krea2_identity_edit_v1_1.safetensors</strong> from <a href="https://huggingface.co/conradlocke/krea2-identity-edit/tree/main" target="_blank" rel="noreferrer">Krea 2 Identity Edit</a> and <strong>edit_anything_v1.1_r256.safetensors</strong> from <a href="https://huggingface.co/Alissonerdx/EditAnything/tree/main" target="_blank" rel="noreferrer">EditAnything</a>; place both in <strong>models/loras</strong>. The editor never downloads models or calls a hosted API.</div>');
+    updateGrounding();
 }
 
 function renderLoraSettings(root, draft) {
@@ -2500,41 +2761,54 @@ function renderLoraSettings(root, draft) {
 }
 
 function renderProjectSettings(root, draft) {
-    root.innerHTML = `<h3>Project format</h3><p>These values define the preview canvas, timeline frame grid, mask frame count, and generated video requests.</p><div class="settings-fields"></div>`;
+    root.innerHTML = `<h3>Project format</h3><p>Set one pixel budget for generation, compositing, and export. The editor preserves the first source video's aspect ratio and rounds dimensions to a model-friendly multiple of 32.</p><div class="settings-fields"></div>`;
     const fields = $(".settings-fields", root);
-    for (const [label, key, min, max] of [["Width", "projectWidth", 64, 8192], ["Height", "projectHeight", 64, 8192], ["Frame rate", "projectFps", 1, 120]]) {
-        const control = input("number", draft[key], { min, max, step: 1 });
-        control.oninput = () => draft[key] = Number(control.value);
-        fields.append(field(label, control));
-    }
+    const aspect = projectAspectRatio();
+    const megapixels = input("number", Number(draft.projectMegapixels || 2).toFixed(2), { min: .1, max: 64, step: .1 });
+    const resolution = document.createElement("div");
+    resolution.className = "full form-help model-note";
+    const updateResolution = () => {
+        draft.projectMegapixels = clamp(Number(megapixels.value) || 2, .1, 64);
+        const size = resolutionForMegapixels(draft.projectMegapixels, aspect);
+        draft.projectWidth = size.width;
+        draft.projectHeight = size.height;
+        resolution.innerHTML = `<strong>${size.width} × ${size.height}</strong> · ${(size.width * size.height / 1_000_000).toFixed(2)} MP actual · source aspect ${aspect.toFixed(4)}:1${draft.projectMegapixels > 1.5 ? "<br>Krea Identity Edit v1.1 recommends about 1–1.5 MP and a 2 MP ceiling; larger projects use more VRAM and may reduce edit quality." : ""}`;
+    };
+    megapixels.oninput = updateResolution;
+    fields.append(field("Resolution", megapixels, "Megapixels; applies to preview, AI generation, compositing, and MP4 export."));
+    const fps = input("number", draft.projectFps, { min: 1, max: 120, step: 1 });
+    fps.oninput = () => draft.projectFps = Number(fps.value);
+    fields.append(field("Frame rate", fps));
+    fields.append(resolution);
     const name = input("text", draft.projectName);
     name.oninput = () => draft.projectName = name.value;
     const wrapper = field("Sequence name", name);
     wrapper.classList.add("full");
     fields.append(wrapper);
+    updateResolution();
 }
 
 function renderWorkflowSettings(root, draft) {
-    root.innerHTML = `<h3>Advanced workflow overrides</h3><p>Inpaint, I2V, SAM3, and Krea use local graphs. Paste API-format JSON here only when a model needs a custom graph. Reference edit uses a user-supplied EditAnything graph because its guide-video layout is model-specific.</p><div class="settings-fields"></div>`;
+    root.innerHTML = `<h3>Advanced workflow overrides</h3><p>Inpaint, I2V, SAM3, and Krea use local graphs. EditAnything v1.1 uses a user-supplied API graph because its BFS looping layout is still experimental.</p><div class="settings-fields"></div>`;
     const fields = $(".settings-fields", root);
     const imageEdit = textarea(draft.imageEditWorkflow || "", '{ "1": { "class_type": "LoadImage", "inputs": { "image": "{{source_image}}" } } }');
     imageEdit.className = "advanced-workflow";
     imageEdit.oninput = () => draft.imageEditWorkflow = imageEdit.value;
-    const imageField = field("Image edit API workflow (optional)", imageEdit, "Use {{source_image}}, {{prompt}}, {{seed}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, and {{krea_edit_lora}} placeholders.");
+    const imageField = field("Image edit API workflow (optional)", imageEdit, "Use {{source_image}}, {{prompt}}, {{seed}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, {{krea_edit_lora}}, and {{krea_grounding_px}} placeholders.");
     imageField.classList.add("full");
     fields.append(imageField);
     const refEdit = textarea(draft.refEditWorkflow || "", '{ "1": { "class_type": "LoadVideo", "inputs": { "file": "{{source_video}}" } } }');
     refEdit.className = "advanced-workflow";
     refEdit.oninput = () => draft.refEditWorkflow = refEdit.value;
-    const refField = field("EditAnything LTX 2.3 reference workflow", refEdit, "Use the matched standard/module LoRAs plus the three boolean EditAnything flag placeholders listed below.");
+    const refField = field("EditAnything v1.1 API workflow", refEdit, "Use a regular LoraLoaderModelOnly before LTXVEditAnythingLoopingSampler. Leave ref_image and editanything_module disconnected; the editor forces all reference-module switches off.");
     refField.classList.add("full");
     fields.append(refField);
-    fields.insertAdjacentHTML("beforeend", `<div class="full form-help">Available placeholders: {{source_video}}, {{reference_image}}, {{prompt}}, {{seed}}, {{width}}, {{height}}, {{fps}}, {{duration}}, {{frame_count}}, {{ltx_checkpoint}}, {{ltx_distilled_lora}}, {{ltx_inpaint_lora}}, {{ltx_text_encoder}}, {{ltx_spatial_upscaler}}, {{sam_checkpoint}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, {{krea_edit_lora}}, {{edit_anything_standard_lora}}, {{edit_anything_module_lora}}, {{edit_anything_enable_visual_crossattn}}, {{edit_anything_enable_role_embedding}}, {{edit_anything_enable_adaln}}.</div>`);
+    fields.insertAdjacentHTML("beforeend", `<div class="full form-help">Available placeholders: {{source_video}}, {{source_image}}, {{reference_image}}, {{prompt}}, {{seed}}, {{width}}, {{height}}, {{fps}}, {{duration}}, {{frame_count}}, {{ltx_checkpoint}}, {{ltx_distilled_lora}}, {{ltx_inpaint_lora}}, {{ltx_text_encoder}}, {{ltx_spatial_upscaler}}, {{sam_checkpoint}}, {{krea_diffusion_model}}, {{krea_text_encoder}}, {{krea_vae}}, {{krea_edit_lora}}, {{krea_grounding_px}}, {{edit_anything_lora}}.</div>`);
 }
 
 function openProjectMenu() {
     const modal = openModal("Project", state.project.name);
-    modal.body.innerHTML = `<div class="form-stack"><div class="clip-summary"><div class="clip-thumb">▶</div><div><strong>${escapeHtml(state.project.name)}</strong><span>${state.project.width}×${state.project.height} · ${state.project.fps} fps · ${formatClock(projectDuration())}</span></div></div><button class="button primary export-mp4">Export MP4</button><button class="button secondary rename">Rename sequence</button><button class="button secondary add-video">Add video track</button><button class="button secondary add-audio">Add audio track</button><button class="button secondary settings">Project settings</button><button class="button secondary export-json">Export edit list</button></div>`;
+    modal.body.innerHTML = `<div class="form-stack"><div class="clip-summary"><div class="clip-thumb">▶</div><div><strong>${escapeHtml(state.project.name)}</strong><span>${state.project.width}×${state.project.height} · ${(state.project.width * state.project.height / 1_000_000).toFixed(2)} MP · ${state.project.fps} fps · ${formatClock(projectDuration())}</span></div></div><button class="button primary export-mp4">Export MP4</button><button class="button secondary rename">Rename sequence</button><button class="button secondary add-video">Add video track</button><button class="button secondary add-audio">Add audio track</button><button class="button secondary settings">Project settings</button><button class="button secondary export-json">Export edit list</button></div>`;
     $(".rename", modal.body).onclick = () => {
         const next = prompt("Sequence name", state.project.name);
         if (next?.trim()) { checkpoint(); state.project.name = next.trim(); renderAll(); closeModal(); }
@@ -2601,6 +2875,70 @@ function drawExportFrame(context, entries, time) {
     }
     for (const entry of entries) {
         if (!active.includes(entry) && !entry.element.paused) entry.element.pause();
+    }
+}
+
+async function renderCompositeRange(start, end, onProgress = () => {}) {
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) throw new Error("This browser cannot render a composited video range");
+    const duration = Math.max(1 / state.project.fps, end - start);
+    const entries = [];
+    let stream = null;
+    try {
+        for (let trackIndex = 0; trackIndex < state.project.tracks.length; trackIndex++) {
+            const track = state.project.tracks[trackIndex];
+            if (!track.enabled || track.kind !== "video") continue;
+            for (const clip of track.clips) {
+                if (clip.start >= end || clip.start + clip.duration <= start) continue;
+                const media = findMedia(clip.mediaId);
+                if (!media) continue;
+                const element = document.createElement("video");
+                element.src = media.url;
+                element.preload = "auto";
+                element.playsInline = true;
+                element.muted = true;
+                await waitFor(element, "loadeddata");
+                const firstFrame = clamp(clip.sourceIn + Math.max(0, start - clip.start), 0, Math.max(0, element.duration - .001));
+                if (Math.abs(element.currentTime - firstFrame) > .001) {
+                    element.currentTime = firstFrame;
+                    await waitFor(element, "seeked");
+                }
+                entries.push({ clip, element, trackIndex });
+            }
+        }
+        if (!entries.length) throw new Error("There is no enabled video under this timeline range");
+        const canvas = document.createElement("canvas");
+        canvas.width = state.project.width;
+        canvas.height = state.project.height;
+        const context = canvas.getContext("2d");
+        stream = canvas.captureStream(state.project.fps);
+        const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm";
+        const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 12_000_000 });
+        const chunks = [];
+        recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+        const finished = new Promise((resolve, reject) => {
+            recorder.onstop = resolve;
+            recorder.onerror = () => reject(new Error("Could not render the composited video range"));
+        });
+        drawExportFrame(context, entries, start);
+        const started = performance.now();
+        recorder.start(500);
+        await new Promise((resolve) => {
+            const render = (now) => {
+                const elapsed = Math.min(duration, (now - started) / 1000);
+                drawExportFrame(context, entries, start + elapsed);
+                onProgress(Math.min(.35, elapsed / duration * .35), "Rendering composited video context in real time…");
+                if (elapsed >= duration) resolve();
+                else requestAnimationFrame(render);
+            };
+            requestAnimationFrame(render);
+        });
+        entries.forEach(({ element }) => element.pause());
+        recorder.stop();
+        await finished;
+        return new Blob(chunks, { type: mimeType });
+    } finally {
+        entries.forEach(({ element }) => { element.pause(); element.removeAttribute("src"); });
+        stream?.getTracks().forEach((track) => track.stop());
     }
 }
 
@@ -2766,6 +3104,12 @@ function bindEvents() {
     $("#split-button").onclick = () => splitClip();
     $("#duplicate-button").onclick = duplicateSelection;
     $("#delete-button").onclick = deleteSelection;
+    $("#snap-button").onclick = () => {
+        state.snapEnabled = !state.snapEnabled;
+        $("#snap-button").classList.toggle("active", state.snapEnabled);
+        $("#snap-button").title = `Clip snapping ${state.snapEnabled ? "on" : "off"}`;
+        showSnapGuide(null);
+    };
     $("#play-button").onclick = togglePlay;
     $("#previous-frame").onclick = () => setPlayhead(state.playhead - 1 / state.project.fps);
     $("#next-frame").onclick = () => setPlayhead(state.playhead + 1 / state.project.fps);
@@ -2803,7 +3147,7 @@ function bindEvents() {
     $("#ai-tools").onclick = (event) => {
         const action = event.target.closest("button")?.dataset.action;
         if (!action) return;
-        ({ sam: openSamMask, "simple-mask": openSimpleMask, inpaint: openInpaint, "image-edit": openImageEdit, i2v: openI2V, "ref-edit": openRefEdit })[action]?.();
+        ({ sam: openSamMask, "simple-mask": openSimpleMask, inpaint: openInpaint, "image-edit": openImageEdit, i2v: openI2V, "edit-anything": openEditAnything, "regenerate-video": () => openTimelineRegeneration("video"), "regenerate-audio": () => openTimelineRegeneration("audio") })[action]?.();
     };
     document.addEventListener("keydown", handleKeyboard);
     window.addEventListener("resize", applyPreviewSize);

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Comfy Cut</title>
-  <link rel="stylesheet" href="/video-editor/assets/styles.css?v=3">
+  <link rel="stylesheet" href="/video-editor/assets/styles.css?v=5">
 </head>
 <body>
   <header class="app-header">
@@ -43,9 +43,11 @@
           <button data-action="inpaint"><span class="ai-icon coral">◩</span><b>Inpaint</b><small>Replace masked areas</small></button>
           <button data-action="image-edit"><span class="ai-icon lime">◇</span><b>Image edit</b><small>Edit a chosen frame</small></button>
           <button data-action="i2v"><span class="ai-icon amber">▶</span><b>Image to video</b><small>Animate a saved frame</small></button>
-          <button data-action="ref-edit"><span class="ai-icon cyan">◎</span><b>Reference edit</b><small>Edit with a reference</small></button>
+          <button data-action="edit-anything"><span class="ai-icon cyan">◎</span><b>EditAnything v1.1</b><small>Prompt-only clip edit</small></button>
+          <button data-action="regenerate-video"><span class="ai-icon violet">↻</span><b>Regenerate video</b><small>Use timeline context</small></button>
+          <button data-action="regenerate-audio"><span class="ai-icon amber">♫</span><b>Generate audio layer</b><small>Keep the original audio</small></button>
         </div>
-        <p class="ai-help" id="ai-help">Select a video clip to use AI tools.</p>
+        <p class="ai-help" id="ai-help">Select a video or audio clip to use AI tools.</p>
       </div>
     </aside>
 
@@ -71,6 +73,7 @@
         <div class="timeline-toolbar">
           <div class="timeline-title"><strong>Timeline</strong><span id="timeline-duration">00:00</span></div>
           <div class="timeline-actions">
+            <button class="icon-button active" id="snap-button" title="Clip snapping on">🧲</button>
             <button class="icon-button" id="split-button" title="Cut at playhead">⌁</button>
             <button class="icon-button" id="duplicate-button" title="Duplicate selection (Ctrl/⌘ D)">⧉</button>
             <button class="icon-button danger-hover" id="delete-button" title="Delete selection">⌫</button>
@@ -83,6 +86,7 @@
             <div class="track-label ruler-label"><span>Tracks</span></div>
             <div class="ruler" id="ruler"></div>
             <div class="tracks" id="tracks"></div>
+            <div class="snap-guide" id="snap-guide" hidden></div>
             <div class="playhead" id="playhead"><span></span></div>
           </div>
         </div>
@@ -114,6 +118,6 @@
   <div id="modal-root"></div>
   <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
   <div class="media-runtime" id="media-runtime" aria-hidden="true"></div>
-  <script type="module" src="/video-editor/assets/app.js?v=3"></script>
+  <script type="module" src="/video-editor/assets/app.js?v=5"></script>
 </body>
 </html>
