@@ -247,18 +247,24 @@ async function saveProject() {
         toast("ComfyUI is offline", "Start ComfyUI before saving a project.", "error");
         return false;
     }
+    const pendingMedia = state.project.media.filter((media) => !media.uploaded && !media.serverRef);
+    if (!state.projectDirty && !pendingMedia.length && state.project.updatedAt) {
+        toast("Project already saved", "No media or edit data changed since the last save.");
+        return true;
+    }
     state.projectSaving = true;
     const button = $("#save-button");
     const oldLabel = button.textContent;
     button.disabled = true;
     try {
-        for (let index = 0; index < state.project.media.length; index++) {
-            button.textContent = `Saving media ${index + 1}/${state.project.media.length}`;
-            const media = state.project.media[index];
+        for (let index = 0; index < pendingMedia.length; index++) {
+            button.textContent = `Uploading media ${index + 1}/${pendingMedia.length}`;
+            const media = pendingMedia[index];
             const resource = await ensureMediaUploaded(media);
             media.uploaded = resource;
             media.serverRef = resource;
         }
+        button.textContent = "Writing project…";
         const updatedAt = new Date().toISOString();
         state.project.updatedAt = updatedAt;
         const payload = {
@@ -1451,6 +1457,14 @@ async function ensureMediaUploaded(media) {
     return media.uploaded;
 }
 
+async function videoMediaInfo(resource) {
+    const response = await apiFetch(`/video-editor/media-info?${new URLSearchParams({ file: annotatedResource(resource) })}`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Could not read the source video frame rate");
+    const info = await response.json();
+    if (!(Number(info.fps) > 0)) throw new Error("The source video has an invalid frame rate");
+    return info;
+}
+
 async function imageBlobAt(clip, clipTime) {
     const media = findMedia(clip.mediaId);
     const video = document.createElement("video");
@@ -1586,11 +1600,10 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     const uploaded = await ensureMediaUploaded(media);
     const fps = state.project.fps;
     const startFrame = Math.round(clip.sourceIn * fps);
-    const sourceFrames = Math.max(1, Math.round(media.duration * fps));
-    const maxWindow = Math.floor((sourceFrames - 1) / 8) * 8 + 1;
-    const endFrame = startFrame + Math.min(maxWindow, Math.max(1, Math.round(clip.duration * fps)));
+    const endFrame = startFrame + Math.max(1, Math.round(clip.duration * fps));
     setNodeInput(prompt, (node) => node.class_type === "LoadVideo", "file", annotatedResource(uploaded));
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify({ mode: "inpaint", selection_start: startFrame, selection_end: endFrame, context_before: 2, context_after: 2, mask: maskData }));
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
     setNodeInput(prompt, nodeTitleIncludes("distilled lora"), "lora_name", state.settings.ltxDistilledLora);
     setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
@@ -1600,6 +1613,7 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
     appendGenerationLoras(prompt, loras);
     return prompt;
@@ -1620,6 +1634,7 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
         : { mode: "regenerate", selection_start: selectionStartFrame, selection_end: selectionEndFrame, context_before: contextBefore, context_after: contextAfter };
     setNodeInput(prompt, (node) => node.class_type === "LoadVideo", "file", annotatedResource(videoReference));
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify(timelineData));
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
     setNodeInput(prompt, nodeTitleIncludes("distilled lora"), "lora_name", state.settings.ltxDistilledLora);
     setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
@@ -1629,6 +1644,7 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
     setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
     if (kind === "audio") {
         setNodeInput(prompt, (node) => node.class_type === "LTXVAudioToAudioInplace", "bypass", true);
         for (const [id, node] of Object.entries(prompt)) if (node.class_type === "SaveVideo") delete prompt[id];
@@ -1659,7 +1675,7 @@ function buildEditAnythingPrompt(videoReference, clip, promptText, seed, loras =
         "7": { inputs: { text_encoder: state.settings.ltxTextEncoder, ckpt_name: state.settings.ltxCheckpoint, device: "default" }, class_type: "LTXAVTextEncoderLoader", _meta: { title: "LTX-2.3 text encoder" } },
         "8": { inputs: { clip: ["7", 0], text: promptText }, class_type: "CLIPTextEncode", _meta: { title: "Edit instruction" } },
         "9": { inputs: { clip: ["7", 0], text: "worst quality, blurry, jittery, distorted, duplicate objects" }, class_type: "CLIPTextEncode", _meta: { title: "Negative prompt" } },
-        "10": { inputs: { positive: ["8", 0], negative: ["9", 0], frame_rate: ["2", 2] }, class_type: "LTXVConditioning", _meta: { title: "LTX conditioning" } },
+        "10": { inputs: { positive: ["8", 0], negative: ["9", 0], frame_rate: state.project.fps }, class_type: "LTXVConditioning", _meta: { title: "LTX conditioning" } },
         "11": { inputs: { width, height, length: frameCount, batch_size: 1 }, class_type: "EmptyLTXVLatentVideo", _meta: { title: "Output video latent" } },
         "12": { inputs: { noise_seed: seed }, class_type: "RandomNoise", _meta: { title: "Generation seed" } },
         "13": { inputs: { sampler_name: "euler_ancestral_cfg_pp" }, class_type: "KSamplerSelect", _meta: { title: "Sampler" } },
@@ -1667,7 +1683,7 @@ function buildEditAnythingPrompt(videoReference, clip, promptText, seed, loras =
         "15": { inputs: { model: ["6", 0], positive: ["10", 0], negative: ["10", 1], cfg: 1 }, class_type: "CFGGuider", _meta: { title: "EditAnything guider" } },
         "16": { inputs: { model: ["6", 0], vae: ["4", 2], noise: ["12", 0], sampler: ["13", 0], sigmas: ["14", 0], guider: ["15", 0], positive: ["10", 0], negative: ["10", 1], latents: ["11", 0], temporal_tile_size: 80, temporal_overlap: 24, blend_overlap: true, lora_name: "(none)", guide_frames: ["3", 0], guide_strength: 1, enable_ic_lora: true, enable_role_embedding: false, enable_adaln: false, reapply_per_chunk: true, enable_visual_crossattn: false, debug_ea: false }, class_type: "LTXVEditAnythingLoopingSampler", _meta: { title: "EditAnything v1.1 looping sampler" } },
         "17": { inputs: { samples: ["16", 0], vae: ["4", 2], tile_size: 768, overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode edited video" } },
-        "18": { inputs: { images: ["17", 0], audio: ["2", 1], fps: ["2", 2] }, class_type: "CreateVideo", _meta: { title: "Edited video with source audio" } },
+        "18": { inputs: { images: ["17", 0], audio: ["2", 1], fps: state.project.fps }, class_type: "CreateVideo", _meta: { title: "Edited video with source audio" } },
         "19": { inputs: { video: ["18", 0], filename_prefix: "video/ComfyCut_EditAnything_v1_1", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save EditAnything result" } },
     };
     const model = appendModelLoras(prompt, ["6", 0], loras);
@@ -1696,7 +1712,21 @@ async function buildI2VPrompt(imageReference, clip, promptText, seed, loras = []
     return prompt;
 }
 
-function buildSamPrompt(videoReference, clip, promptText, options) {
+function samFrameLayout(clip, frameRate) {
+    const sourceStartFrame = Math.max(0, Math.floor(clip.sourceIn * frameRate + 1e-6));
+    const lastProjectTime = Math.max(0, clip.duration - 1 / state.project.fps);
+    const sourceEndFrame = Math.max(sourceStartFrame, Math.floor((clip.sourceIn + lastProjectTime) * frameRate + 1e-6));
+    const frameCount = sourceEndFrame - sourceStartFrame + 1;
+    return { frameRate, sourceStartFrame, frameCount, startTime: sourceStartFrame / frameRate, duration: frameCount / frameRate };
+}
+
+function samMaskFrameIndex(sam, sourceIn, time) {
+    const frame = Math.floor((sourceIn + time) * sam.frameRate + 1e-6) - sam.sourceStartFrame;
+    return clamp(frame, 0, sam.frames.length - 1);
+}
+
+function buildSamPrompt(videoReference, clip, promptText, options, frameRate) {
+    const layout = samFrameLayout(clip, frameRate);
     const detectInputs = {
         model: ["3", 0],
         threshold: options.threshold,
@@ -1711,7 +1741,7 @@ function buildSamPrompt(videoReference, clip, promptText, options) {
     if (promptText.trim()) trackInputs.conditioning = ["4", 0];
     return {
         "1": { inputs: { file: annotatedResource(videoReference) }, class_type: "LoadVideo", _meta: { title: "Source clip" } },
-        "2": { inputs: { video: ["1", 0], start_time: clip.sourceIn, duration: clip.duration, strict_duration: false }, class_type: "Video Slice", _meta: { title: "Selected clip only" } },
+        "2": { inputs: { video: ["1", 0], start_time: layout.startTime, duration: layout.duration, strict_duration: false }, class_type: "Video Slice", _meta: { title: "Frame-aligned selected clip" } },
         "9": { inputs: { video: ["2", 0] }, class_type: "GetVideoComponents", _meta: { title: "Video frames" } },
         "3": { inputs: { ckpt_name: state.settings.samCheckpoint }, class_type: "CheckpointLoaderSimple", _meta: { title: "SAM3 model" } },
         "4": { inputs: { clip: ["3", 1], text: promptText || "object" }, class_type: "CLIPTextEncode", _meta: { title: "Object description" } },
@@ -1720,6 +1750,7 @@ function buildSamPrompt(videoReference, clip, promptText, options) {
         "11": { inputs: trackInputs, class_type: "SAM3_VideoTrack", _meta: { title: "Track mask through clip" } },
         "12": { inputs: { track_data: ["11", 0], object_indices: "" }, class_type: "SAM3_TrackToMask", _meta: { title: "Tracked mask" } },
         "6": { inputs: { mask: ["12", 0] }, class_type: "MaskToImage", _meta: { title: "Mask preview" } },
+        "13": { inputs: { images: ["6", 0], filename_prefix: "ComfyCut/SAM3_mask_frames" }, class_type: "SaveImage", _meta: { title: "Save exact mask frames" } },
         "7": { inputs: { images: ["6", 0], fps: ["9", 2] }, class_type: "CreateVideo", _meta: { title: "Mask video" } },
         "8": { inputs: { video: ["7", 0], filename_prefix: "video/ComfyCut_SAM3_mask", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save mask" } },
     };
@@ -1939,7 +1970,9 @@ async function openSimpleMask() {
     const samVideo = document.createElement("video");
     samVideo.muted = true;
     samVideo.preload = "auto";
+    const samImage = new Image();
     let samTime = -1;
+    let samFrameIndex = -1;
     const maskOverlay = document.createElement("canvas");
     const editor = await frameEditor(clip, canvas, (context, time) => {
         if (maskOverlay.width !== canvas.width || maskOverlay.height !== canvas.height) {
@@ -1948,8 +1981,9 @@ async function openSimpleMask() {
         }
         const maskContext = maskOverlay.getContext("2d", { willReadFrequently: true });
         maskContext.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-        if (samVideo.src && samVideo.readyState >= 2 && samTime === time) {
-            maskContext.drawImage(samVideo, 0, 0, maskOverlay.width, maskOverlay.height);
+        const exactMaskReady = working.sam?.frames?.length && samImage.complete && samImage.naturalWidth && samTime === time;
+        if (exactMaskReady || (samVideo.src && samVideo.readyState >= 2 && samTime === time)) {
+            maskContext.drawImage(exactMaskReady ? samImage : samVideo, 0, 0, maskOverlay.width, maskOverlay.height);
             binarizeMask(maskOverlay);
             maskContext.globalCompositeOperation = "source-in";
             maskContext.fillStyle = "#ff4652";
@@ -1972,10 +2006,22 @@ async function openSimpleMask() {
         if (seeking) return;
         seeking = true;
         try {
-            while (editor.time !== requestedTime || (samVideo.src && samTime !== requestedTime)) {
+            while (editor.time !== requestedTime || ((working.sam?.frames?.length || samVideo.src) && samTime !== requestedTime)) {
                 const target = requestedTime;
                 await editor.seek(target);
-                if (samVideo.src) {
+                if (working.sam?.frames?.length) {
+                    const frameIndex = samMaskFrameIndex(working.sam, clip.sourceIn, target);
+                    if (frameIndex !== samFrameIndex) {
+                        await new Promise((resolve, reject) => {
+                            samImage.onload = resolve;
+                            samImage.onerror = () => reject(new Error("Could not decode the SAM3 mask frame"));
+                            samImage.src = resourceUrl(working.sam.frames[frameIndex]);
+                        });
+                        samFrameIndex = frameIndex;
+                    }
+                    samTime = target;
+                    editor.draw();
+                } else if (samVideo.src) {
                     const sourceTime = clamp((working.sam?.trimmed ? working.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, samVideo.duration - .001));
                     if (Math.abs(samVideo.currentTime - sourceTime) > .001) {
                         samVideo.currentTime = sourceTime;
@@ -1989,7 +2035,7 @@ async function openSimpleMask() {
             seeking = false;
         }
     };
-    if (working.sam?.url) {
+    if (!working.sam?.frames?.length && working.sam?.url) {
         samVideo.src = working.sam.url;
         await waitFor(samVideo, "loadedmetadata");
     }
@@ -2179,11 +2225,13 @@ async function openSamMask() {
     const overlayVideo = document.createElement("video");
     overlayVideo.muted = true;
     overlayVideo.preload = "auto";
+    const overlayImage = new Image();
     let tool = "positive";
     let boxStart = null;
     let boxDraft = null;
     let stroke = null;
     let overlayTime = -1;
+    let overlayFrameIndex = -1;
     const maskOverlay = document.createElement("canvas");
     const editor = await frameEditor(clip, canvas, (context, time) => {
         if (maskOverlay.width !== canvas.width || maskOverlay.height !== canvas.height) {
@@ -2192,8 +2240,9 @@ async function openSamMask() {
         }
         const maskContext = maskOverlay.getContext("2d", { willReadFrequently: true });
         maskContext.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-        if (overlayVideo.src && overlayVideo.readyState >= 2 && overlayTime === time) {
-            maskContext.drawImage(overlayVideo, 0, 0, maskOverlay.width, maskOverlay.height);
+        const exactMaskReady = existing.sam?.frames?.length && overlayImage.complete && overlayImage.naturalWidth && overlayTime === time;
+        if (exactMaskReady || (overlayVideo.src && overlayVideo.readyState >= 2 && overlayTime === time)) {
+            maskContext.drawImage(exactMaskReady ? overlayImage : overlayVideo, 0, 0, maskOverlay.width, maskOverlay.height);
             binarizeMask(maskOverlay);
             maskContext.globalCompositeOperation = "source-in";
             maskContext.fillStyle = "#ff4652";
@@ -2223,10 +2272,22 @@ async function openSamMask() {
         if (seeking) return;
         seeking = true;
         try {
-            while (editor.time !== requestedTime || (overlayVideo.src && overlayTime !== requestedTime)) {
+            while (editor.time !== requestedTime || ((existing.sam?.frames?.length || overlayVideo.src) && overlayTime !== requestedTime)) {
                 const target = requestedTime;
                 await editor.seek(target);
-                if (overlayVideo.src) {
+                if (existing.sam?.frames?.length) {
+                    const frameIndex = samMaskFrameIndex(existing.sam, clip.sourceIn, target);
+                    if (frameIndex !== overlayFrameIndex) {
+                        await new Promise((resolve, reject) => {
+                            overlayImage.onload = resolve;
+                            overlayImage.onerror = () => reject(new Error("Could not decode the SAM3 mask frame"));
+                            overlayImage.src = resourceUrl(existing.sam.frames[frameIndex]);
+                        });
+                        overlayFrameIndex = frameIndex;
+                    }
+                    overlayTime = target;
+                    editor.draw();
+                } else if (overlayVideo.src) {
                     const sourceTime = clamp((existing.sam?.trimmed ? existing.sam.offset || 0 : clip.sourceIn) + target, 0, Math.max(0, overlayVideo.duration - .001));
                     if (Math.abs(overlayVideo.currentTime - sourceTime) > .001) {
                         overlayVideo.currentTime = sourceTime;
@@ -2240,7 +2301,9 @@ async function openSamMask() {
             seeking = false;
         }
     };
-    if (existing.sam?.url) {
+    if (existing.sam?.frames?.length) {
+        await seekBoth(0);
+    } else if (existing.sam?.url) {
         overlayVideo.src = existing.sam.url;
         await waitFor(overlayVideo, "loadedmetadata");
         await seekBoth(0);
@@ -2314,22 +2377,29 @@ async function openSamMask() {
         const job = generationStatus(jobSlot);
         try {
             const samOptions = { ...options, threshold: Number($(".sam-threshold", modal.body).value), refine: Number($(".sam-refine", modal.body).value) };
-            const key = await generationKey("sam3-track", { source: generationSource(clip, false), promptText, options: samOptions, checkpoint: state.settings.samCheckpoint });
-            let resource = cachedGeneration(clip, key);
-            const reused = Boolean(resource);
-            if (!resource) {
-                const media = findMedia(clip.mediaId);
-                const reference = await ensureMediaUploaded(media);
-                const workflow = buildSamPrompt(reference, clip, promptText, samOptions);
+            const media = findMedia(clip.mediaId);
+            const reference = await ensureMediaUploaded(media);
+            const mediaInfo = await videoMediaInfo(reference);
+            media.fps = Number(mediaInfo.fps);
+            const layout = samFrameLayout(clip, media.fps);
+            const key = await generationKey("sam3-track-v2", { source: generationSource(clip, false), promptText, options: samOptions, checkpoint: state.settings.samCheckpoint, frameRate: media.fps, layout });
+            let maskOutput = cachedGeneration(clip, key);
+            const reused = Boolean(maskOutput?.video && maskOutput?.frames?.length);
+            if (!reused) {
+                const workflow = buildSamPrompt(reference, clip, promptText, samOptions, media.fps);
                 const result = await runPrompt(workflow, job.callbacks);
-                resource = pickResource(result.resources, "video");
-                if (!resource) throw new Error("SAM3 finished without a mask video output");
-                rememberGeneration(clip, key, resource);
+                const video = pickResource(result.resources, "video");
+                const frames = result.resources.filter((resource) => ["png", "jpg", "jpeg", "webp"].includes(resource.filename.split(".").pop().toLowerCase()));
+                if (!video) throw new Error("SAM3 finished without a mask video output");
+                if (frames.length !== layout.frameCount) throw new Error(`SAM3 returned ${frames.length} mask frames; expected ${layout.frameCount}`);
+                maskOutput = { video, frames, frameRate: media.fps, sourceStartFrame: layout.sourceStartFrame };
+                rememberGeneration(clip, key, maskOutput);
             }
-            overlayVideo.src = resourceUrl(resource);
+            existing.sam = { prompt: promptText, ...options, threshold: Number($(".sam-threshold", modal.body).value), refine: Number($(".sam-refine", modal.body).value), trackerVersion: 2, resource: maskOutput.video, url: resourceUrl(maskOutput.video), frames: maskOutput.frames, frameRate: maskOutput.frameRate, sourceStartFrame: maskOutput.sourceStartFrame, trimmed: true, offset: 0 };
+            overlayVideo.removeAttribute("src");
+            overlayVideo.load();
             overlayTime = -1;
-            await waitFor(overlayVideo, "loadedmetadata");
-            existing.sam = { prompt: promptText, ...options, threshold: Number($(".sam-threshold", modal.body).value), refine: Number($(".sam-refine", modal.body).value), trackerVersion: 1, resource, url: resourceUrl(resource), trimmed: true, offset: 0 };
+            overlayFrameIndex = -1;
             await seekBoth(editor.time);
             job.complete(reused ? "Reused cached result — no model nodes ran" : "SAM3 tracked mask ready");
         } catch (error) {
@@ -2414,7 +2484,9 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
     maskCanvas.height = Math.max(1, Math.round(maskCanvas.width * maskSource.height / maskSource.width));
     const maskContext = maskCanvas.getContext("2d", { willReadFrequently: true });
     const maskVideo = document.createElement("video");
-    if (clip.mask.sam?.url) {
+    const maskImage = new Image();
+    let maskFrameIndex = -1;
+    if (!clip.mask.sam?.frames?.length && clip.mask.sam?.url) {
         maskVideo.src = clip.mask.sam.url;
         maskVideo.muted = true;
         maskVideo.preload = "auto";
@@ -2426,8 +2498,20 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
         const time = index / state.project.fps;
         tileContext.clearRect(0, 0, tileWidth, tileHeight);
         maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-        if (maskVideo.src) {
-            const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
+        const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
+        if (clip.mask.sam?.frames?.length) {
+            const frameIndex = samMaskFrameIndex(clip.mask.sam, sourceIn, time);
+            if (frameIndex !== maskFrameIndex) {
+                await new Promise((resolve, reject) => {
+                    maskImage.onload = resolve;
+                    maskImage.onerror = () => reject(new Error("Could not decode the SAM3 mask frame"));
+                    maskImage.src = resourceUrl(clip.mask.sam.frames[frameIndex]);
+                });
+                maskFrameIndex = frameIndex;
+            }
+            maskContext.drawImage(maskImage, 0, 0, maskCanvas.width, maskCanvas.height);
+            binarizeMask(maskCanvas);
+        } else if (maskVideo.src) {
             const target = clamp((clip.mask.sam?.trimmed ? clip.mask.sam.offset || 0 : sourceIn) + time, 0, Math.max(0, maskVideo.duration - .001));
             if (Math.abs(maskVideo.currentTime - target) > .001) {
                 maskVideo.currentTime = target;
@@ -2620,7 +2704,7 @@ async function openTimelineRegeneration(kind) {
         try {
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey(`regenerate-${kind}`, { selectedClip: { id: clip.id, start: clip.start, duration: clip.duration }, sequence: videoSequenceSource(rangeStart, rangeEnd), promptText, seed, contextBefore: actualBefore, contextAfter, format: generationFormat(), models: ltxGenerationModels("regenerate"), loras });
+            const key = await generationKey(`regenerate-${kind}-project-fps-v2`, { selectedClip: { id: clip.id, start: clip.start, duration: clip.duration }, sequence: videoSequenceSource(rangeStart, rangeEnd), promptText, seed, contextBefore: actualBefore, contextAfter, format: generationFormat(), models: ltxGenerationModels("regenerate"), loras });
             output = cachedGeneration(clip, key);
             if (output) {
                 generatedSourceIn = actualBefore;
@@ -2680,7 +2764,7 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-pad-and-trim-v2", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);
@@ -2990,7 +3074,7 @@ async function openEditAnything() {
         try {
             const seed = Number($(".seed", controls).value);
             const loras = selectedLoras();
-            const key = await generationKey("edit-anything-v1.1", { source: generationSource(clip, false), promptText, seed, format: generationFormat(), models: ltxGenerationModels("edit-anything"), loras });
+            const key = await generationKey("edit-anything-v1.1-project-fps-v2", { source: generationSource(clip, false), promptText, seed, format: generationFormat(), models: ltxGenerationModels("edit-anything"), loras });
             output = cachedGeneration(clip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), 0, clip.duration);

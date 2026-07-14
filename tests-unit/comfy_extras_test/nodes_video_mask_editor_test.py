@@ -2,12 +2,12 @@ import json
 from fractions import Fraction
 
 import numpy as np
-import pytest
 import torch
 from PIL import Image
 
 from comfy_api.latest import InputImpl, Types
 from comfy_extras.nodes_video_mask_editor import (
+    VideoTimeline,
     VideoTimelineApply,
     _load_keyframes,
     _resolve_timeline_window,
@@ -92,9 +92,20 @@ def test_timeline_window_clamps_context_at_end():
     assert (start, end) == (75, 100)
 
 
-def test_timeline_window_rejects_selection_larger_than_valid_ltx_window():
-    with pytest.raises(ValueError, match="too long"):
-        _resolve_timeline_window(100, 0, 100, 0, 0)
+def test_timeline_window_pads_full_selection_to_next_ltx_length():
+    assert _resolve_timeline_window(100, 0, 100, 0, 0) == (0, 105, 0, 100)
+
+
+def test_timeline_pads_with_last_frame(monkeypatch):
+    images = torch.arange(100, dtype=torch.float32).reshape(100, 1, 1, 1).expand(-1, 8, 8, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(30)))
+    monkeypatch.setattr("comfy_extras.nodes_video_mask_editor._save_preview", lambda *args: {})
+
+    output = VideoTimeline.execute(video, json.dumps({"mode": "regenerate", "selection_start": 0, "selection_end": 100, "context_before": 0, "context_after": 0}), frame_rate=24).result
+
+    assert output[0].shape[0] == 105
+    assert torch.equal(output[0][99], output[0][104])
+    assert output[5] == 24
 
 
 def test_slice_audio_uses_video_frame_boundaries():
@@ -119,3 +130,17 @@ def test_apply_timeline_edit_preserves_original_audio():
     assert components.images[4:7].all()
     assert not components.images[7:].any()
     assert torch.equal(components.audio["waveform"], audio["waveform"])
+
+
+def test_apply_timeline_edit_trims_ltx_padding_and_sets_frame_rate():
+    images = torch.zeros(100, 8, 8, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(30)))
+    edited = torch.ones(105, 8, 8, 3)
+    mask = torch.ones(105, 8, 8)
+
+    output = VideoTimelineApply.execute(video, edited, mask, start_frame=0, feather=0, frame_rate=24).result[0]
+    components = output.get_components()
+
+    assert components.images.shape[0] == 100
+    assert components.images.all()
+    assert components.frame_rate == 24

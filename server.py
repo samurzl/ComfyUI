@@ -25,6 +25,7 @@ import struct
 import ssl
 import socket
 import ipaddress
+import av
 from PIL import Image, ImageOps
 from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
@@ -339,6 +340,22 @@ class PromptServer():
             response = web.FileResponse(os.path.join(self.video_editor_root, "index.html"))
             response.headers['Cache-Control'] = 'no-store, must-revalidate'
             return response
+
+        @routes.get("/video-editor/media-info")
+        async def get_video_editor_media_info(request):
+            file = request.rel_url.query.get("file", "")
+            if not file or not folder_paths.exists_annotated_filepath(file):
+                return web.Response(status=404)
+            path = folder_paths.get_annotated_filepath(file)
+            try:
+                with av.open(path) as container:
+                    stream = container.streams.video[0]
+                    duration = float(container.duration / av.time_base) if container.duration is not None else float(stream.duration * stream.time_base) if stream.duration is not None else 0.0
+                    fps = float(stream.average_rate) if stream.average_rate else float(stream.frames / duration) if stream.frames and duration > 0 else 1.0
+                    frame_count = int(stream.frames) if stream.frames else round(duration * fps)
+            except (av.error.FFmpegError, IndexError):
+                return web.Response(status=400, text="Could not read video metadata")
+            return web.json_response({"fps": fps, "duration": duration, "frame_count": frame_count})
 
         @routes.get("/embeddings")
         def get_embeddings(request):

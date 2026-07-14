@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -126,17 +127,13 @@ def _resolve_timeline_window(frame_count, selection_start, selection_end, contex
         raise ValueError("The source video has no decodable frames")
     selection_start = max(0, min(int(selection_start), frame_count - 1))
     selection_end = max(selection_start + 1, min(int(selection_end), frame_count))
-    max_length = (frame_count - 1) // 8 * 8 + 1
-    if selection_end - selection_start > max_length:
-        raise ValueError("The selected range is too long for LTXV's 8n+1 frame layout")
-
     requested_start = max(0, selection_start - max(0, int(context_before)))
     requested_end = min(frame_count, selection_end + max(0, int(context_after)))
     requested_length = requested_end - requested_start
-    window_length = min(max_length, ((requested_length - 1 + 7) // 8) * 8 + 1)
+    window_length = ((requested_length - 1 + 7) // 8) * 8 + 1
 
     earliest_start = max(0, selection_end - window_length)
-    latest_start = min(selection_start, frame_count - window_length)
+    latest_start = min(selection_start, max(0, frame_count - window_length))
     window_start = min(max(requested_start, earliest_start), latest_start)
     return window_start, window_start + window_length, selection_start, selection_end
 
@@ -166,8 +163,7 @@ def _waveform_preview(audio, bucket_count=1000):
 
 def _timeline_settings(timeline_data, frame_count, frame_rate):
     data = json.loads(timeline_data) if timeline_data else {}
-    max_length = (frame_count - 1) // 8 * 8 + 1
-    default_end = min(frame_count, max_length, max(1, round(frame_rate)))
+    default_end = min(frame_count, max(1, round(frame_rate)))
     selection_start = data.get("selection_start", 0)
     selection_end = data.get("selection_end", default_end)
     context_before = data.get("context_before", 2.0)
@@ -196,6 +192,7 @@ class VideoTimeline(io.ComfyNode):
             inputs=[
                 io.Video.Input("video"),
                 io.String.Input("timeline_data", default="", socketless=True, extra_dict={"hidden": True}),
+                io.Float.Input("frame_rate", default=0.0, min=0.0, max=240.0, tooltip="Output frame rate, or 0 to preserve the source frame rate."),
             ],
             outputs=[
                 io.Image.Output("source"),
@@ -208,14 +205,16 @@ class VideoTimeline(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, video: Input.Video, timeline_data) -> io.NodeOutput:
+    def execute(cls, video: Input.Video, timeline_data, frame_rate=0.0) -> io.NodeOutput:
         components = video.get_components()
         images = components.images
         frame_count, height, width, _ = images.shape
-        frame_rate = float(components.frame_rate)
-        data, window, context_before, context_after = _timeline_settings(timeline_data, frame_count, frame_rate)
+        output_frame_rate = Fraction(str(frame_rate)) if frame_rate > 0 else components.frame_rate
+        data, window, context_before, context_after = _timeline_settings(timeline_data, frame_count, float(output_frame_rate))
         window_start, window_end, selection_start, selection_end = window
-        source = images[window_start:window_end].clone()
+        source = images[window_start:min(window_end, frame_count)].clone()
+        if window_end > frame_count:
+            source = torch.cat((source, source[-1:].expand(window_end - frame_count, -1, -1, -1)))
 
         mask = torch.zeros(
             window_end - window_start,
@@ -237,13 +236,13 @@ class VideoTimeline(io.ComfyNode):
 
         color = torch.tensor(_INPAINT_COLOR, dtype=source.dtype, device=source.device)
         guide = source * (1.0 - mask.unsqueeze(-1)) + color.view(1, 1, 1, 3) * mask.unsqueeze(-1)
-        audio = _slice_audio(components.audio, window_start, window_end, frame_rate)
+        audio = _slice_audio(components.audio, window_start, window_end, float(output_frame_rate))
 
-        preview = _save_preview(images, components.frame_rate, "video_timeline", components.audio)
+        preview = _save_preview(images, output_frame_rate, "video_timeline", components.audio)
         editor_data = {
             "video": preview,
             "frame_count": frame_count,
-            "fps": frame_rate,
+            "fps": float(output_frame_rate),
             "width": width,
             "height": height,
             "has_audio": components.audio is not None,
@@ -256,7 +255,7 @@ class VideoTimeline(io.ComfyNode):
             "window_start": window_start,
             "window_end": window_end,
         }
-        return io.NodeOutput(source, guide, mask, audio, window_start, frame_rate, ui={"video_timeline": [editor_data]})
+        return io.NodeOutput(source, guide, mask, audio, window_start, float(output_frame_rate), ui={"video_timeline": [editor_data]})
 
 
 class VideoTimelineApply(io.ComfyNode):
@@ -273,19 +272,25 @@ class VideoTimelineApply(io.ComfyNode):
                 io.Mask.Input("mask"),
                 io.Int.Input("start_frame", default=0, min=0),
                 io.Int.Input("feather", default=8, min=0, max=64),
+                io.Float.Input("frame_rate", default=0.0, min=0.0, max=240.0, tooltip="Output frame rate, or 0 to preserve the source frame rate."),
             ],
             outputs=[io.Video.Output("video")],
         )
 
     @classmethod
-    def execute(cls, video: Input.Video, edited_images, mask, start_frame, feather) -> io.NodeOutput:
+    def execute(cls, video: Input.Video, edited_images, mask, start_frame, feather, frame_rate=0.0) -> io.NodeOutput:
         components = video.get_components()
         images = components.images
         frame_count = edited_images.shape[0]
         if mask.shape[0] != frame_count:
             raise ValueError("Edited images and timeline mask must have the same frame count")
-        if start_frame + frame_count > images.shape[0]:
+        available_frames = images.shape[0] - start_frame
+        if available_frames < 1:
             raise ValueError("The edited timeline range exceeds the source video")
+        if frame_count > available_frames:
+            frame_count = available_frames
+            edited_images = edited_images[:frame_count]
+            mask = mask[:frame_count]
 
         height, width = images.shape[1:3]
         if edited_images.shape[1:3] != (height, width):
@@ -309,7 +314,7 @@ class VideoTimelineApply(io.ComfyNode):
         source.mul_(1.0 - alpha).addcmul_(edited_images, alpha)
 
         output = InputImpl.VideoFromComponents(
-            Types.VideoComponents(images=result, audio=components.audio, frame_rate=components.frame_rate),
+            Types.VideoComponents(images=result, audio=components.audio, frame_rate=Fraction(str(frame_rate)) if frame_rate > 0 else components.frame_rate),
             bit_depth=video.get_bit_depth(),
         )
         return io.NodeOutput(output)
