@@ -204,7 +204,7 @@ def create_block_external_middleware():
         else:
             response = await handler(request)
 
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' data:; frame-src 'self'; object-src 'self';"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self'; connect-src 'self' data:; frame-src 'self'; object-src 'self';"
         return response
 
     return block_external_middleware
@@ -251,6 +251,7 @@ class PromptServer():
             if args.front_end_root is None
             else args.front_end_root
         )
+        self.video_editor_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app", "video_editor")
         logging.info(f"[Prompt Server] web root: {self.web_root}")
         if args.enable_assets:
             register_assets_routes(self.app, self.user_manager)
@@ -330,6 +331,13 @@ class PromptServer():
             response.headers['Cache-Control'] = 'no-store, must-revalidate'
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
+            return response
+
+        @routes.get("/video-editor")
+        @routes.get("/video-editor/")
+        async def get_video_editor(request):
+            response = web.FileResponse(os.path.join(self.video_editor_root, "index.html"))
+            response.headers['Cache-Control'] = 'no-store, must-revalidate'
             return response
 
         @routes.get("/embeddings")
@@ -1257,6 +1265,11 @@ class PromptServer():
             self.app.add_routes([
                 web.static('/docs', embedded_docs_path)
             ])
+
+        self.app.add_routes([
+            web.static('/video-editor/assets', self.video_editor_root),
+            web.static('/video-editor/blueprints', os.path.join(os.path.dirname(os.path.abspath(__file__)), "blueprints")),
+        ])
 
         self.app.add_routes([
             web.static('/', self.web_root),

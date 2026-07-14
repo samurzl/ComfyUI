@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Comfy Cut</title>
+  <link rel="stylesheet" href="/video-editor/assets/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand" aria-label="Comfy Cut home">
+      <span class="brand-mark">C</span>
+      <div><strong>Comfy Cut</strong><span>AI video editor</span></div>
+    </div>
+    <nav class="main-tools" aria-label="Project tools">
+      <button class="button primary" id="import-button"><span>＋</span> Import video</button>
+      <span class="tool-divider"></span>
+      <button class="icon-button" id="undo-button" title="Undo (Ctrl/⌘ Z)" aria-label="Undo">↶</button>
+      <button class="icon-button" id="redo-button" title="Redo (Ctrl/⌘ Shift Z)" aria-label="Redo">↷</button>
+      <button class="tool-button active" data-tool="select" title="Selection tool (V)"><span>↖</span> Select</button>
+      <button class="tool-button" data-tool="cut" title="Cut tool (C)"><span>⌁</span> Cut</button>
+      <button class="tool-button" id="link-button" title="Move linked video and audio together"><span>⛓</span> Linked</button>
+    </nav>
+    <div class="header-actions">
+      <div class="backend-pill" id="backend-pill"><i></i><span>Checking ComfyUI…</span></div>
+      <button class="icon-button" id="settings-button" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="library-panel panel">
+      <div class="panel-heading"><div><span class="eyebrow">Project</span><h2>Media</h2></div><button class="small-icon" id="media-add" title="Import video">＋</button></div>
+      <div class="media-bin" id="media-bin">
+        <button class="empty-media" id="empty-import"><span>＋</span><strong>Import your first video</strong><small>MP4, MOV, WebM, and more</small></button>
+      </div>
+      <div class="panel-section ai-section">
+        <span class="eyebrow">Selected clip</span>
+        <h2>AI tools</h2>
+        <div class="ai-grid" id="ai-tools">
+          <button data-action="sam"><span class="ai-icon violet">✦</span><b>SAM3 mask</b><small>Track any subject</small></button>
+          <button data-action="simple-mask"><span class="ai-icon blue">◐</span><b>Simple mask</b><small>Shapes over time</small></button>
+          <button data-action="inpaint"><span class="ai-icon coral">◩</span><b>Inpaint</b><small>Replace masked areas</small></button>
+          <button data-action="image-edit"><span class="ai-icon lime">◇</span><b>Image edit</b><small>Edit a chosen frame</small></button>
+          <button data-action="i2v"><span class="ai-icon amber">▶</span><b>Image to video</b><small>Animate a saved frame</small></button>
+          <button data-action="ref-edit"><span class="ai-icon cyan">◎</span><b>Reference edit</b><small>Edit with a reference</small></button>
+        </div>
+        <p class="ai-help" id="ai-help">Select a video clip to use AI tools.</p>
+      </div>
+    </aside>
+
+    <section class="edit-area">
+      <div class="viewer panel">
+        <div class="viewer-topline"><span id="sequence-title">Untitled sequence</span><span id="viewer-resolution">1920 × 1080 · 30 fps</span></div>
+        <div class="canvas-wrap" id="canvas-wrap">
+          <canvas id="preview-canvas" width="960" height="540"></canvas>
+          <div class="viewer-empty" id="viewer-empty"><span>▶</span><strong>Your canvas is ready</strong><small>Import a video to begin editing</small></div>
+        </div>
+        <div class="transport">
+          <button class="icon-button" id="previous-frame" title="Previous frame">│◀</button>
+          <button class="play-button" id="play-button" aria-label="Play">▶</button>
+          <button class="icon-button" id="next-frame" title="Next frame">▶│</button>
+          <time id="timecode">00:00:00:00</time>
+          <div class="transport-spacer"></div>
+          <button class="text-button" id="fit-button">Fit</button>
+          <button class="text-button" id="project-button">Project <span>⌄</span></button>
+        </div>
+      </div>
+
+      <section class="timeline panel" aria-label="Timeline editor">
+        <div class="timeline-toolbar">
+          <div class="timeline-title"><strong>Timeline</strong><span id="timeline-duration">00:00</span></div>
+          <div class="timeline-actions">
+            <button class="icon-button" id="split-button" title="Cut at playhead">⌁</button>
+            <button class="icon-button" id="duplicate-button" title="Duplicate selection (Ctrl/⌘ D)">⧉</button>
+            <button class="icon-button danger-hover" id="delete-button" title="Delete selection">⌫</button>
+            <span class="tool-divider"></span>
+            <span class="zoom-icon">−</span><input id="timeline-zoom" type="range" min="35" max="220" value="90" aria-label="Timeline zoom"><span class="zoom-icon">＋</span>
+          </div>
+        </div>
+        <div class="timeline-scroll" id="timeline-scroll">
+          <div class="timeline-surface" id="timeline-surface">
+            <div class="track-label ruler-label"><span>Tracks</span></div>
+            <div class="ruler" id="ruler"></div>
+            <div class="tracks" id="tracks"></div>
+            <div class="playhead" id="playhead"><span></span></div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <aside class="inspector-panel panel">
+      <div class="panel-heading"><div><span class="eyebrow">Properties</span><h2>Inspector</h2></div></div>
+      <div id="inspector-empty" class="inspector-empty"><span>↖</span><strong>No clip selected</strong><small>Select a clip in the timeline to adjust it.</small></div>
+      <div id="inspector" hidden>
+        <div class="clip-summary"><div class="clip-thumb" id="clip-thumb">▶</div><div><strong id="clip-name"></strong><span id="clip-meta"></span></div><button class="small-icon" id="clip-menu" title="Clip menu">•••</button></div>
+        <div class="property-section">
+          <div class="section-title"><strong>Transform</strong><button class="reset-link" id="reset-transform">Reset</button></div>
+          <label>Scale <span class="field-with-unit"><input id="prop-scale" type="number" min="1" max="500" step="1"><i>%</i></span></label>
+          <label>Position X <span class="field-with-unit"><input id="prop-x" type="number" step="1"><i>px</i></span></label>
+          <label>Position Y <span class="field-with-unit"><input id="prop-y" type="number" step="1"><i>px</i></span></label>
+          <label>Rotation <span class="field-with-unit"><input id="prop-rotation" type="number" step="0.1"><i>°</i></span></label>
+          <label>Opacity <span class="field-with-unit"><input id="prop-opacity" type="number" min="0" max="100" step="1"><i>%</i></span></label>
+        </div>
+        <div class="property-section asset-section">
+          <div class="section-title"><strong>Attached assets</strong><button class="reset-link" id="clear-assets">Clear all</button></div>
+          <div id="clip-assets" class="clip-assets"></div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <input type="file" id="file-input" accept="video/*" hidden>
+  <div id="modal-root"></div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+  <div class="media-runtime" id="media-runtime" aria-hidden="true"></div>
+  <script type="module" src="/video-editor/assets/app.js"></script>
+</body>
+</html>
