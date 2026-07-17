@@ -1640,12 +1640,13 @@ function requireNodes(types, feature) {
 }
 
 function applyLtxVaeTileSize(prompt) {
-    const node = Object.values(prompt).find((candidate) => candidate.class_type === "VAEDecodeTiled");
-    if (!node) return;
-    node.inputs.tile_size = ltxVaeTileSize();
+    for (const node of Object.values(prompt)) {
+        if (node.class_type === "VAEDecodeTiled") node.inputs.tile_size = ltxVaeTileSize();
+    }
 }
 
 async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) {
+    requireNodes(["VideoInpaintPreprocess", "VideoInpaintPyramidBlend"], "Two-stage LTX inpaint");
     const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
     const { prompt } = graphToPrompt(data.definitions.subgraphs[0]);
     const media = findMedia(clip.mediaId);
@@ -1663,10 +1664,48 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, (node) => node.class_type === "LTXVAudioVAELoader", "ckpt_name", state.settings.ltxCheckpoint);
     setNodeInput(prompt, nodeTitleIncludes("edit prompt"), "value", promptText);
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
-    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 0);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
-    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "composited", false);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
+
+    const timelineId = promptNodeId(prompt, (node) => node.class_type === "VideoTimeline");
+    const sourceResizeId = promptNodeId(prompt, nodeTitleIncludes("prepare ltx guide"));
+    const sizeId = promptNodeId(prompt, (node) => node.class_type === "GetImageSize");
+    const guideId = promptNodeId(prompt, (node) => node.class_type === "LTXVAddGuide");
+    const checkpointId = promptNodeId(prompt, (node) => node.class_type === "CheckpointLoaderSimple");
+    const modelId = promptNodeId(prompt, nodeTitleIncludes("in/outpainting"));
+    const stageOneSamplerId = promptNodeId(prompt, (node) => node.class_type === "SamplerCustomAdvanced");
+    const stageOneSeparateId = promptNodeId(prompt, (node) => node.class_type === "LTXVSeparateAVLatent");
+    const cropId = promptNodeId(prompt, (node) => node.class_type === "LTXVCropGuides");
+    const stageOneDecodeId = promptNodeId(prompt, (node) => node.class_type === "VAEDecodeTiled");
+    const timelineApplyId = promptNodeId(prompt, (node) => node.class_type === "VideoTimelineApply");
+    const stageOneWidth = Math.max(64, Math.round(state.project.width / 64) * 32);
+    const stageOneHeight = Math.max(64, Math.round(state.project.height / 64) * 32);
+    const vaeTileSize = ltxVaeTileSize();
+    const vaeTileOverlap = Math.min(64, Math.floor(vaeTileSize / 4));
+
+    prompt[sourceResizeId].inputs = { input: [timelineId, 0], resize_type: "scale to multiple", "resize_type.multiple": 32, scale_method: "area" };
+    prompt["9000"] = { inputs: { input: [sourceResizeId, 0], resize_type: "scale dimensions", "resize_type.width": stageOneWidth, "resize_type.height": stageOneHeight, "resize_type.crop": "disabled", scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 half-resolution source" } };
+    prompt["9001"] = { inputs: { input: [timelineId, 2], resize_type: "match size", "resize_type.match": ["9000", 0], "resize_type.crop": "disabled", scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 mask" } };
+    prompt["9002"] = { inputs: { mask: ["9001", 0], expand: 8, tapered_corners: true }, class_type: "GrowMask", _meta: { title: "Stage 1 mask safety margin" } };
+    prompt["9003"] = { inputs: { images: ["9000", 0], mask: ["9002", 0] }, class_type: "VideoInpaintPreprocess", _meta: { title: "Stage 1 masked guide" } };
+    prompt[sizeId].inputs.image = ["9003", 0];
+    prompt[guideId].inputs.image = ["9003", 0];
+    prompt[stageOneSeparateId].inputs.av_latent = [stageOneSamplerId, 1];
+    prompt["9004"] = { inputs: { generated: [stageOneDecodeId, 0], source: ["9000", 0], mask: ["9002", 0], grow: 0, levels: 5 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Stage 1 boundary blend" } };
+    prompt["9005"] = { inputs: { input: ["9004", 0], resize_type: "match size", "resize_type.match": [sourceResizeId, 0], "resize_type.crop": "disabled", scale_method: "lanczos" }, class_type: "ResizeImageMaskNode", _meta: { title: "Upscale first pass for refinement" } };
+    prompt["9006"] = { inputs: { pixels: ["9005", 0], vae: [checkpointId, 2], tile_size: vaeTileSize, overlap: vaeTileOverlap, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEEncodeTiled", _meta: { title: "Encode first pass for refinement" } };
+    prompt["9007"] = { inputs: { video_latent: ["9006", 0], audio_latent: [stageOneSeparateId, 1] }, class_type: "LTXVConcatAVLatent", _meta: { title: "Stage 2 AV latent" } };
+    prompt["9008"] = { inputs: { noise_seed: seed }, class_type: "RandomNoise", _meta: { title: "Stage 2 noise" } };
+    prompt["9009"] = { inputs: { sampler_name: "euler_cfg_pp" }, class_type: "KSamplerSelect", _meta: { title: "Stage 2 sampler" } };
+    prompt["9010"] = { inputs: { sigmas: "0.7250, 0.4219, 0.0" }, class_type: "ManualSigmas", _meta: { title: "Stage 2 refinement schedule" } };
+    prompt["9011"] = { inputs: { model: [modelId, 0], positive: [cropId, 0], negative: [cropId, 1], cfg: 1 }, class_type: "CFGGuider", _meta: { title: "Stage 2 guider" } };
+    prompt["9012"] = { inputs: { noise: ["9008", 0], guider: ["9011", 0], sampler: ["9009", 0], sigmas: ["9010", 0], latent_image: ["9007", 0] }, class_type: "SamplerCustomAdvanced", _meta: { title: "Stage 2 refinement" } };
+    prompt["9013"] = { inputs: { av_latent: ["9012", 0] }, class_type: "LTXVSeparateAVLatent", _meta: { title: "Stage 2 video latent" } };
+    prompt["9014"] = { inputs: { samples: ["9013", 0], vae: [checkpointId, 2], tile_size: vaeTileSize, overlap: vaeTileOverlap, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode refined video" } };
+    prompt["9015"] = { inputs: { generated: ["9014", 0], source: [sourceResizeId, 0], mask: [timelineId, 2], grow: 0, levels: 6 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Final inpaint boundary blend" } };
+    prompt[timelineApplyId].inputs.edited_images = ["9015", 0];
+    prompt[timelineApplyId].inputs.composited = true;
     applyLtxVaeTileSize(prompt);
     applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
     appendGenerationLoras(prompt, loras);
@@ -2565,7 +2604,7 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
     const firstFrame = Math.round(clip.sourceIn * state.project.fps);
     const lastMaskTime = Math.max(0, (clip.maskSource?.duration ?? clip.duration) - 1 / state.project.fps);
     for (let index = 0; index < frameCount; index++) {
-        const time = clamp(clip.maskSource?.frameTimes?.[index] ?? index / state.project.fps, 0, lastMaskTime);
+        const time = clamp(roundFrame(clip.maskSource?.frameTimes?.[index] ?? index / state.project.fps), 0, lastMaskTime);
         tileContext.clearRect(0, 0, tileWidth, tileHeight);
         maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
@@ -2855,7 +2894,7 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint-frame-synced-v6", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-two-stage-v7", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);
