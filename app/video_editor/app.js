@@ -1665,6 +1665,7 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "composited", false);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
     applyLtxVaeTileSize(prompt);
     applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
@@ -1697,6 +1698,7 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "composited", false);
     if (kind === "audio") {
         setNodeInput(prompt, (node) => node.class_type === "LTXVAudioToAudioInplace", "bypass", true);
         for (const [id, node] of Object.entries(prompt)) if (node.class_type === "SaveVideo") delete prompt[id];
