@@ -2563,8 +2563,9 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
     }
     const frames = [];
     const firstFrame = Math.round(clip.sourceIn * state.project.fps);
+    const lastMaskTime = Math.max(0, (clip.maskSource?.duration ?? clip.duration) - 1 / state.project.fps);
     for (let index = 0; index < frameCount; index++) {
-        const time = index / state.project.fps;
+        const time = clamp(clip.maskSource?.frameTimes?.[index] ?? index / state.project.fps, 0, lastMaskTime);
         tileContext.clearRect(0, 0, tileWidth, tileHeight);
         maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
@@ -2675,7 +2676,12 @@ async function bakeClip(clip, onProgress = () => {}, includeTransform = true, pa
     canvas.width = state.project.width;
     canvas.height = state.project.height;
     const context = canvas.getContext("2d");
-    const stream = canvas.captureStream(state.project.fps);
+    const stream = canvas.captureStream(0);
+    const frameTrack = stream.getVideoTracks()[0];
+    if (!frameTrack?.requestFrame) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("This browser cannot bake frame-synchronized video clips");
+    }
     let audioContext;
     try {
         audioContext = new AudioContext();
@@ -2695,35 +2701,51 @@ async function bakeClip(clip, onProgress = () => {}, includeTransform = true, pa
         recorder.onerror = () => reject(new Error("Could not render the transformed clip"));
     });
     const transform = includeTransform ? clip.transform || defaultTransform() : defaultTransform();
-    const targetFrames = Math.ceil((Math.max(1, Math.round(clip.duration * state.project.fps)) - 1) / 8) * 8 + 1;
-    const bakedDuration = padToLtx ? targetFrames / state.project.fps : clip.duration;
+    const sourceFrames = Math.max(1, Math.round(clip.duration * state.project.fps));
+    const targetFrames = padToLtx ? Math.ceil((sourceFrames - 1) / 8) * 8 + 1 : sourceFrames;
+    const bakedDuration = targetFrames / state.project.fps;
+    const frameTimes = [];
+    const drawFrame = () => {
+        context.fillStyle = "black";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        const sourceRatio = video.videoWidth / video.videoHeight;
+        const targetRatio = canvas.width / canvas.height;
+        let width;
+        let height;
+        if (sourceRatio > targetRatio) {
+            width = canvas.width * transform.scale / 100;
+            height = width / sourceRatio;
+        } else {
+            height = canvas.height * transform.scale / 100;
+            width = height * sourceRatio;
+        }
+        context.save();
+        context.globalAlpha = transform.opacity / 100;
+        context.translate(canvas.width / 2 + transform.x, canvas.height / 2 + transform.y);
+        context.rotate(transform.rotation * Math.PI / 180);
+        context.drawImage(video, -width / 2, -height / 2, width, height);
+        context.restore();
+    };
+    let capturedFrames = 0;
+    const captureFrame = () => {
+        if (capturedFrames < sourceFrames) drawFrame();
+        const time = capturedFrames < sourceFrames ? video.currentTime - clip.sourceIn : frameTimes.at(-1);
+        frameTimes.push(clamp(time || 0, 0, Math.max(0, clip.duration - 1 / state.project.fps)));
+        frameTrack.requestFrame();
+        capturedFrames++;
+    };
+    drawFrame();
+    recorder.start(500);
+    captureFrame();
     await video.play();
     const started = performance.now();
-    recorder.start(500);
     await new Promise((resolve) => {
         const draw = () => {
             const elapsed = (performance.now() - started) / 1000;
-            context.fillStyle = "black";
-            context.fillRect(0, 0, canvas.width, canvas.height);
-            const sourceRatio = video.videoWidth / video.videoHeight;
-            const targetRatio = canvas.width / canvas.height;
-            let width;
-            let height;
-            if (sourceRatio > targetRatio) {
-                width = canvas.width * transform.scale / 100;
-                height = width / sourceRatio;
-            } else {
-                height = canvas.height * transform.scale / 100;
-                width = height * sourceRatio;
-            }
-            context.save();
-            context.globalAlpha = transform.opacity / 100;
-            context.translate(canvas.width / 2 + transform.x, canvas.height / 2 + transform.y);
-            context.rotate(transform.rotation * Math.PI / 180);
-            context.drawImage(video, -width / 2, -height / 2, width, height);
-            context.restore();
+            const dueFrames = Math.min(targetFrames, Math.floor(elapsed * state.project.fps + 1e-6) + 1);
+            while (capturedFrames < dueFrames) captureFrame();
             onProgress(clamp(elapsed / bakedDuration, 0, .99), includeTransform ? "Baking clip transforms in real time…" : "Scaling clip to the project resolution in real time…");
-            if (elapsed >= bakedDuration || (!padToLtx && video.currentTime >= clip.sourceIn + clip.duration)) resolve();
+            if (elapsed >= bakedDuration) resolve();
             else requestAnimationFrame(draw);
         };
         draw();
@@ -2737,7 +2759,7 @@ async function bakeClip(clip, onProgress = () => {}, includeTransform = true, pa
     const uploaded = await uploadBlob(blob, `transformed-${Date.now()}.webm`);
     onProgress(1, "Transformed clip ready");
     const temporaryMedia = { id: uid("render"), name: "Transformed clip", url: URL.createObjectURL(blob), file: blob, uploaded, serverRef: uploaded, duration: bakedDuration, width: state.project.width, height: state.project.height };
-    const temporaryClip = { ...structuredClone(clip), mediaId: temporaryMedia.id, sourceIn: 0, duration: bakedDuration, sourceDuration: bakedDuration, transform: defaultTransform(), maskSource: { mediaId: clip.mediaId, sourceIn: clip.sourceIn, transform: structuredClone(transform) } };
+    const temporaryClip = { ...structuredClone(clip), mediaId: temporaryMedia.id, sourceIn: 0, duration: bakedDuration, sourceDuration: bakedDuration, transform: defaultTransform(), maskSource: { mediaId: clip.mediaId, sourceIn: clip.sourceIn, duration: clip.duration, frameTimes, transform: structuredClone(transform) } };
     state.project.media.push(temporaryMedia);
     return { clip: temporaryClip, media: temporaryMedia, cleanup: () => {
         state.project.media = state.project.media.filter((item) => item.id !== temporaryMedia.id);
@@ -2833,7 +2855,7 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint-source-conditioned-v5", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-frame-synced-v6", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);
