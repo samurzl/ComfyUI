@@ -34,6 +34,7 @@ function emptyProject(width = 1920, height = 1080, fps = 30) {
 const defaultSettings = {
     samCheckpoint: "sam3.1_multiplex_fp16.safetensors",
     ltxCheckpoint: "ltx-2.3-22b-dev-fp8.safetensors",
+    ltxVaeTileSize: 768,
     ltxDistillationMode: "distilled",
     ltxDistilledLora: "ltx-2.3-22b-distilled-lora-384.safetensors",
     ltxDmdLora: "LTX2.3_DMD_reshaped_r256.safetensors",
@@ -99,6 +100,7 @@ function readSettings() {
 function normalizeSettings(settings) {
     settings.loraLibrary = Array.isArray(settings.loraLibrary) ? settings.loraLibrary : [];
     if (!LTX_DISTILLATION_PROFILES[settings.ltxDistillationMode]) settings.ltxDistillationMode = "distilled";
+    settings.ltxVaeTileSize = ltxVaeTileSize(settings);
     settings.projectMegapixels ||= (Number(settings.projectWidth) || 1920) * (Number(settings.projectHeight) || 1080) / 1_000_000;
     if (!settings.editAnythingLora && /edit_anything_v1\.1/i.test(settings.editAnythingStandardLora || "")) settings.editAnythingLora = settings.editAnythingStandardLora;
     delete settings.kreaCheckpoint;
@@ -107,6 +109,19 @@ function normalizeSettings(settings) {
     delete settings.editAnythingModuleLora;
     delete settings.refEditWorkflow;
     return settings;
+}
+
+function ltxVaeTileSize(settings = state.settings) {
+    return Math.round(clamp(Number(settings.ltxVaeTileSize) || 768, 64, 4096) / 32) * 32;
+}
+
+function ltxVaeTileLayout(width, height, settings = state.settings) {
+    const tileSize = ltxVaeTileSize(settings);
+    const overlap = tileSize < 256 ? Math.floor(tileSize / 4) : 64;
+    const tiles = (length) => length <= tileSize ? 1 : Math.ceil((length - overlap) / (tileSize - overlap));
+    const columns = tiles(width);
+    const rows = tiles(height);
+    return { tileSize, columns, rows, count: columns * rows };
 }
 
 function resolutionForMegapixels(megapixels, aspectRatio) {
@@ -1438,7 +1453,7 @@ function ltxDistillation(settings = state.settings) {
 
 function ltxGenerationModels(kind) {
     const distillation = ltxDistillation();
-    const models = { checkpoint: state.settings.ltxCheckpoint, distilledLora: distillation.lora, textEncoder: state.settings.ltxTextEncoder };
+    const models = { checkpoint: state.settings.ltxCheckpoint, distilledLora: distillation.lora, textEncoder: state.settings.ltxTextEncoder, vaeTileSize: ltxVaeTileSize() };
     if (distillation.mode === "dmd") models.distillationMode = "dmd";
     if (kind === "i2v") models.spatialUpscaler = state.settings.ltxSpatialUpscaler;
     if (kind === "inpaint" || kind === "regenerate") models.inpaintLora = state.settings.ltxInpaintLora;
@@ -1624,6 +1639,12 @@ function requireNodes(types, feature) {
     if (missing.length) throw new Error(`${feature} needs these local custom nodes: ${missing.join(", ")}`);
 }
 
+function applyLtxVaeTileSize(prompt) {
+    const node = Object.values(prompt).find((candidate) => candidate.class_type === "VAEDecodeTiled");
+    if (!node) return;
+    node.inputs.tile_size = ltxVaeTileSize();
+}
+
 async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) {
     requireNodes(["VideoInpaintPreprocess", "VideoInpaintPyramidBlend"], "Two-stage LTX inpaint");
     const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
@@ -1676,7 +1697,7 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     prompt["9011"] = { inputs: { model: [modelId, 0], positive: [cropId, 0], negative: [cropId, 1], cfg: 1 }, class_type: "CFGGuider", _meta: { title: "Stage 2 guider" } };
     prompt["9012"] = { inputs: { noise: ["9008", 0], guider: ["9011", 0], sampler: ["9009", 0], sigmas: ["9010", 0], latent_image: ["9007", 0] }, class_type: "SamplerCustomAdvanced", _meta: { title: "Stage 2 refinement" } };
     prompt["9013"] = { inputs: { av_latent: ["9012", 0] }, class_type: "LTXVSeparateAVLatent", _meta: { title: "Stage 2 video latent" } };
-    prompt["9014"] = { inputs: { samples: ["9013", 0], vae: [checkpointId, 2], tile_size: 768, overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode refined video" } };
+    prompt["9014"] = { inputs: { samples: ["9013", 0], vae: [checkpointId, 2], tile_size: ltxVaeTileSize(), overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode refined video" } };
     prompt["9015"] = { inputs: { generated: ["9014", 0], source: [sourceResizeId, 0], mask: [timelineId, 2], grow: 8, levels: 6 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Final inpaint boundary blend" } };
     prompt[timelineApplyId].inputs.edited_images = ["9015", 0];
     prompt[timelineApplyId].inputs.composited = true;
@@ -1721,6 +1742,7 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
         prompt["9102"] = { inputs: { video: ["9101", 0], filename_prefix: "video/ComfyCut_regenerated_audio", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save regenerated audio" } };
     } else {
         setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_regenerated_video");
+        applyLtxVaeTileSize(prompt);
     }
     applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
     appendGenerationLoras(prompt, loras);
@@ -1748,7 +1770,7 @@ function buildEditAnythingPrompt(videoReference, clip, promptText, seed, loras =
         "14": { inputs: { sigmas: "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0" }, class_type: "ManualSigmas", _meta: { title: "LTX distilled schedule" } },
         "15": { inputs: { model: ["6", 0], positive: ["10", 0], negative: ["10", 1], cfg: 1 }, class_type: "CFGGuider", _meta: { title: "EditAnything guider" } },
         "16": { inputs: { model: ["6", 0], vae: ["4", 2], noise: ["12", 0], sampler: ["13", 0], sigmas: ["14", 0], guider: ["15", 0], positive: ["10", 0], negative: ["10", 1], latents: ["11", 0], temporal_tile_size: 80, temporal_overlap: 24, blend_overlap: true, lora_name: "(none)", guide_frames: ["3", 0], guide_strength: 1, enable_ic_lora: true, enable_role_embedding: false, enable_adaln: false, reapply_per_chunk: true, enable_visual_crossattn: false, debug_ea: false }, class_type: "LTXVEditAnythingLoopingSampler", _meta: { title: "EditAnything v1.1 looping sampler" } },
-        "17": { inputs: { samples: ["16", 0], vae: ["4", 2], tile_size: 768, overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode edited video" } },
+        "17": { inputs: { samples: ["16", 0], vae: ["4", 2], tile_size: ltxVaeTileSize(), overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode edited video" } },
         "18": { inputs: { images: ["17", 0], audio: ["2", 1], fps: state.project.fps }, class_type: "CreateVideo", _meta: { title: "Edited video with source audio" } },
         "19": { inputs: { video: ["18", 0], filename_prefix: "video/ComfyCut_EditAnything_v1_1", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save EditAnything result" } },
     };
@@ -1776,6 +1798,7 @@ async function buildI2VPrompt(imageReference, clip, promptText, seed, loras = []
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     const outputLink = graph.outputs[0]?.linkIds?.[0];
     prompt["9001"] = { inputs: { video: resolveLink(outputLink), filename_prefix: "video/ComfyCut_i2v", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Comfy Cut output" } };
+    applyLtxVaeTileSize(prompt);
     applyLtxDistillation(prompt, (node) => node.class_type === "LoraLoaderModelOnly" && node.inputs.lora_name === distillation.lora);
     appendGenerationLoras(prompt, loras);
     return prompt;
@@ -3303,6 +3326,7 @@ function renderProjectSettings(root, draft) {
     const fields = $(".settings-fields", root);
     const aspect = projectAspectRatio();
     const megapixels = input("number", Number(draft.projectMegapixels || 2).toFixed(2), { min: .1, max: 64, step: .1 });
+    const vaeTileSize = input("number", ltxVaeTileSize(draft), { min: 64, max: 4096, step: 32 });
     const resolution = document.createElement("div");
     resolution.className = "full form-help model-note";
     const updateResolution = () => {
@@ -3310,10 +3334,22 @@ function renderProjectSettings(root, draft) {
         const size = resolutionForMegapixels(draft.projectMegapixels, aspect);
         draft.projectWidth = size.width;
         draft.projectHeight = size.height;
-        resolution.innerHTML = `<strong>${size.width} × ${size.height}</strong> · ${(size.width * size.height / 1_000_000).toFixed(2)} MP actual · source aspect ${aspect.toFixed(4)}:1${draft.projectMegapixels > 1.5 ? "<br>Krea Identity Edit v1.1 recommends about 1–1.5 MP and a 2 MP ceiling; larger projects use more VRAM and may reduce edit quality." : ""}`;
+        const layout = ltxVaeTileLayout(size.width, size.height, draft);
+        const tileWarning = layout.count > 1 ? `<br><strong>⚠ LTX final VAE decode will use ${layout.columns} × ${layout.rows} = ${layout.count} overlapping ${layout.tileSize}px tiles.</strong> Increase the tile size above if VRAM allows.` : "";
+        resolution.innerHTML = `<strong>${size.width} × ${size.height}</strong> · ${(size.width * size.height / 1_000_000).toFixed(2)} MP actual · source aspect ${aspect.toFixed(4)}:1${draft.projectMegapixels > 1.5 ? "<br>Krea Identity Edit v1.1 recommends about 1–1.5 MP and a 2 MP ceiling; larger projects use more VRAM and may reduce edit quality." : ""}${tileWarning}`;
     };
     megapixels.oninput = updateResolution;
+    vaeTileSize.oninput = () => {
+        draft.ltxVaeTileSize = Number(vaeTileSize.value);
+        updateResolution();
+    };
+    vaeTileSize.onchange = () => {
+        draft.ltxVaeTileSize = ltxVaeTileSize(draft);
+        vaeTileSize.value = draft.ltxVaeTileSize;
+        updateResolution();
+    };
     fields.append(field("Resolution", megapixels, "Megapixels; applies to preview, AI generation, compositing, and MP4 export."));
+    fields.append(field("LTX VAE decode tile size", vaeTileSize, "Output pixels per spatial tile. Larger tiles reduce overlap and decode time but use more VRAM."));
     const fps = input("number", draft.projectFps, { min: 1, max: 120, step: 1 });
     fps.oninput = () => draft.projectFps = Number(fps.value);
     fields.append(field("Frame rate", fps));
