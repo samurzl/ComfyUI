@@ -989,28 +989,20 @@ function activeClips(kind, time = state.playhead) {
 
 function syncRuntime() {
     const activeIds = new Set();
-    for (const kind of ["audio", "video"]) {
+    for (const kind of ["video", "audio"]) {
         for (const { clip } of activeClips(kind)) {
             const element = runtimeElement(clip, kind);
             if (!element) continue;
             activeIds.add(clip.id);
             const sourceTime = clip.sourceIn + state.playhead - clip.start;
-            const drift = sourceTime - element.currentTime;
-            const tolerance = kind === "audio" ? (state.playing ? 0.045 : 0.015) : (state.playing ? 0.18 : 0.025);
-            if (Math.abs(drift) > tolerance) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration || clip.sourceDuration));
-            if (kind === "audio") {
-                element.muted = false;
-                element.playbackRate = state.playing && Math.abs(drift) <= tolerance ? clamp(1 + drift * .5, .97, 1.03) : 1;
-            }
+            if (Math.abs(element.currentTime - sourceTime) > (state.playing ? 0.18 : 0.025)) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration || clip.sourceDuration));
+            if (kind === "audio") element.muted = false;
             if (state.playing && element.paused) element.play().catch(() => {});
             if (!state.playing && !element.paused) element.pause();
         }
     }
     for (const [id, element] of state.runtime) {
-        if (!activeIds.has(id)) {
-            if (!element.paused) element.pause();
-            element.playbackRate = 1;
-        }
+        if (!activeIds.has(id) && !element.paused) element.pause();
     }
 }
 
