@@ -1646,16 +1646,15 @@ function applyLtxVaeTileSize(prompt) {
 }
 
 async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) {
-    requireNodes(["VideoInpaintPreprocess", "VideoInpaintPyramidBlend"], "Two-stage LTX inpaint");
+    requireNodes(["VideoProjectFormat", "VideoInpaintPreprocess", "VideoInpaintPyramidBlend"], "Two-stage LTX inpaint");
     const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
     const { prompt } = graphToPrompt(data.definitions.subgraphs[0]);
     const media = findMedia(clip.mediaId);
     const uploaded = await ensureMediaUploaded(media);
     const fps = state.project.fps;
-    const startFrame = Math.round(clip.sourceIn * fps);
-    const endFrame = startFrame + Math.max(1, Math.round(clip.duration * fps));
+    const endFrame = Math.max(1, Math.round(clip.duration * fps));
     setNodeInput(prompt, (node) => node.class_type === "LoadVideo", "file", annotatedResource(uploaded));
-    setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify({ mode: "inpaint", selection_start: startFrame, selection_end: endFrame, context_before: 2, context_after: 2, mask: maskData }));
+    setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify({ mode: "inpaint", selection_start: 0, selection_end: endFrame, context_before: 0, context_after: 0, mask: maskData }));
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
     setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
@@ -1668,6 +1667,7 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
 
+    const loadId = promptNodeId(prompt, (node) => node.class_type === "LoadVideo");
     const timelineId = promptNodeId(prompt, (node) => node.class_type === "VideoTimeline");
     const sourceResizeId = promptNodeId(prompt, nodeTitleIncludes("prepare ltx guide"));
     const sizeId = promptNodeId(prompt, (node) => node.class_type === "GetImageSize");
@@ -1684,6 +1684,9 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     const vaeTileSize = ltxVaeTileSize();
     const vaeTileOverlap = Math.min(64, Math.floor(vaeTileSize / 4));
 
+    prompt["8998"] = { inputs: { video: [loadId, 0], frame_rate: fps, width: state.project.width, height: state.project.height, start_time: clip.sourceIn, duration: clip.duration }, class_type: "VideoProjectFormat", _meta: { title: "Project-format source clip" } };
+    prompt[timelineId].inputs.video = ["8998", 0];
+    prompt[timelineApplyId].inputs.video = ["8998", 0];
     prompt[sourceResizeId].inputs = { input: [timelineId, 0], resize_type: "scale to multiple", "resize_type.multiple": 32, scale_method: "area" };
     prompt["9000"] = { inputs: { input: [sourceResizeId, 0], resize_type: "scale dimensions", "resize_type.width": stageOneWidth, "resize_type.height": stageOneHeight, "resize_type.crop": "disabled", scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 half-resolution source" } };
     prompt["9001"] = { inputs: { input: [timelineId, 2], resize_type: "match size", "resize_type.match": ["9000", 0], "resize_type.crop": "disabled", scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 mask" } };
@@ -2568,10 +2571,11 @@ function generationStatus(root) {
     };
 }
 
-async function makeMaskAtlas(clip, onProgress = () => {}) {
+async function makeMaskAtlas(clip, onProgress = () => {}, padToLtx = false, firstFrame = null) {
     if (!hasMask(clip)) throw new Error("This clip has no mask");
     const media = findMedia(clip.mediaId);
-    const frameCount = Math.max(1, Math.round(clip.duration * state.project.fps));
+    const sourceFrameCount = Math.max(1, Math.round(clip.duration * state.project.fps));
+    const frameCount = padToLtx ? Math.ceil((sourceFrameCount - 1) / 8) * 8 + 1 : sourceFrameCount;
     const tileWidth = Math.min(384, media.width);
     const tileHeight = Math.max(1, Math.round(tileWidth * media.height / media.width));
     const maxColumns = Math.max(1, Math.floor(12000 / tileWidth));
@@ -2601,10 +2605,11 @@ async function makeMaskAtlas(clip, onProgress = () => {}) {
         await waitFor(maskVideo, "loadeddata");
     }
     const frames = [];
-    const firstFrame = Math.round(clip.sourceIn * state.project.fps);
+    firstFrame ??= Math.round(clip.sourceIn * state.project.fps);
     const lastMaskTime = Math.max(0, (clip.maskSource?.duration ?? clip.duration) - 1 / state.project.fps);
     for (let index = 0; index < frameCount; index++) {
-        const time = clamp(roundFrame(clip.maskSource?.frameTimes?.[index] ?? index / state.project.fps), 0, lastMaskTime);
+        const sourceIndex = Math.min(index, sourceFrameCount - 1);
+        const time = clamp(roundFrame(clip.maskSource?.frameTimes?.[sourceIndex] ?? sourceIndex / state.project.fps), 0, lastMaskTime);
         tileContext.clearRect(0, 0, tileWidth, tileHeight);
         maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         const sourceIn = clip.maskSource?.sourceIn ?? clip.sourceIn;
@@ -2894,17 +2899,16 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint-two-stage-v7", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-backend-resampled-v8", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);
                 job.complete("Reused cached result — no model nodes ran");
                 return;
             }
-            baked = await bakeClip(sourceClip, job.callbacks.onProgress, useTransform, true);
-            const clip = baked.clip;
-            clip.mask = structuredClone(sourceClip.mask);
-            const atlas = await makeMaskAtlas(clip, job.callbacks.onProgress);
+            const clip = useTransform ? (baked = await bakeClip(sourceClip, job.callbacks.onProgress, true, true)).clip : sourceClip;
+            if (useTransform) clip.mask = structuredClone(sourceClip.mask);
+            const atlas = await makeMaskAtlas(clip, job.callbacks.onProgress, true, 0);
             const workflow = await buildInpaintPrompt(clip, promptText, seed, atlas, loras);
             jobSlot.addEventListener("preview", (event) => showJobImage(preview, event.detail), { once: false });
             jobSlot.addEventListener("intermediate", (event) => {

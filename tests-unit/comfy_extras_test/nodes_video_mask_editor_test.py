@@ -9,9 +9,11 @@ from comfy_api.latest import InputImpl, Types
 from comfy_extras.nodes_video_mask_editor import (
     VideoInpaintPreprocess,
     VideoInpaintPyramidBlend,
+    VideoProjectFormat,
     VideoTimeline,
     VideoTimelineApply,
     _load_keyframes,
+    _prepare_timeline_images,
     _resolve_timeline_window,
     _slice_audio,
     _track_video,
@@ -32,6 +34,24 @@ class _FakeModel:
             return torch.float32
 
     model = Model()
+
+
+def test_prepare_timeline_images_resamples_with_stable_source_indices():
+    images = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1).expand(-1, 2, 2, 3)
+
+    output = _prepare_timeline_images(images, Fraction(3), Fraction(6))
+
+    assert output[:, 0, 0, 0].tolist() == [0, 0, 1, 1, 2, 2]
+
+
+def test_project_format_outputs_one_shared_frame_sequence():
+    images = torch.arange(30, dtype=torch.float32).reshape(30, 1, 1, 1).expand(-1, 2, 2, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(30)))
+
+    output = VideoProjectFormat.execute(video, frame_rate=24, width=2, height=2, start_time=10 / 24, duration=5 / 24).result[0].get_components()
+
+    assert output.frame_rate == 24
+    assert output.images[:, 0, 0, 0].tolist() == [12, 13, 15, 16, 17]
 
 
 def _mask(x, y):
@@ -108,6 +128,18 @@ def test_timeline_pads_with_last_frame(monkeypatch):
     assert output[0].shape[0] == 105
     assert torch.equal(output[0][99], output[0][104])
     assert output[5] == 24
+
+
+def test_timeline_repeats_last_inpaint_mask_into_ltx_padding(monkeypatch):
+    images = torch.zeros(100, 8, 8, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(30)))
+    monkeypatch.setattr("comfy_extras.nodes_video_mask_editor._save_preview", lambda *args: {})
+    monkeypatch.setattr("comfy_extras.nodes_video_mask_editor._load_keyframes", lambda *args: {99: torch.ones(8, 8)})
+
+    output = VideoTimeline.execute(video, json.dumps({"mode": "inpaint", "selection_start": 0, "selection_end": 100, "context_before": 0, "context_after": 0, "mask": {}})).result
+
+    assert output[2].shape[0] == 105
+    assert output[2][99:].all()
 
 
 def test_slice_audio_uses_video_frame_boundaries():

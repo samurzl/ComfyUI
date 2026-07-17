@@ -167,6 +167,29 @@ def _resize_mask(mask, height, width):
     return F.interpolate(mask.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False)[:, 0]
 
 
+def _prepare_timeline_images(images, source_frame_rate, output_frame_rate, width=0, height=0, start_frame=0, frame_count=None):
+    target_frame_count = images.shape[0]
+    if source_frame_rate != output_frame_rate:
+        source_rate = float(source_frame_rate)
+        target_rate = float(output_frame_rate)
+        target_frame_count = max(1, round(images.shape[0] * target_rate / source_rate))
+        end_frame = target_frame_count if frame_count is None else min(target_frame_count, start_frame + frame_count)
+        indices = [min(images.shape[0] - 1, int(frame * source_rate / target_rate + 1e-6)) for frame in range(start_frame, end_frame)]
+        images = images[indices]
+    else:
+        end_frame = target_frame_count if frame_count is None else min(target_frame_count, start_frame + frame_count)
+        images = images[start_frame:end_frame]
+
+    source_height, source_width = images.shape[1:3]
+    if width <= 0 and height > 0:
+        width = max(1, round(source_width * height / source_height))
+    elif height <= 0 and width > 0:
+        height = max(1, round(source_height * width / source_width))
+    if width > 0 and height > 0 and (source_width, source_height) != (width, height):
+        images = comfy.utils.common_upscale(images.movedim(-1, 1), width, height, "lanczos", "disabled").movedim(1, -1)
+    return images
+
+
 def _pyramid_blend_chunk(image_a, image_b, mask, levels):
     gaussian_a = [image_a]
     gaussian_b = [image_b]
@@ -205,6 +228,49 @@ def _timeline_settings(timeline_data, frame_count, frame_rate):
         round(max(0.0, float(context_after)) * frame_rate),
     )
     return data, window, float(context_before), float(context_after)
+
+
+class VideoProjectFormat(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="VideoProjectFormat",
+            display_name="Conform Video to Project",
+            category="video",
+            inputs=[
+                io.Video.Input("video"),
+                io.Float.Input("frame_rate", default=24.0, min=1.0, max=240.0),
+                io.Int.Input("width", default=1920, min=1, max=16384),
+                io.Int.Input("height", default=1080, min=1, max=16384),
+                io.Float.Input("start_time", default=0.0, min=0.0, max=1e5),
+                io.Float.Input("duration", default=0.0, min=0.0, max=1e5),
+            ],
+            outputs=[io.Video.Output("video")],
+        )
+
+    @classmethod
+    def execute(cls, video: Input.Video, frame_rate, width, height, start_time=0.0, duration=0.0) -> io.NodeOutput:
+        components = video.get_components()
+        output_frame_rate = Fraction(str(frame_rate))
+        converted_frame_count = max(1, round(components.images.shape[0] * float(output_frame_rate) / float(components.frame_rate)))
+        start_frame = min(converted_frame_count - 1, max(0, round(start_time * frame_rate)))
+        frame_count = converted_frame_count - start_frame if duration <= 0 else min(converted_frame_count - start_frame, max(1, round(duration * frame_rate)))
+        end_frame = start_frame + frame_count
+        images = _prepare_timeline_images(
+            components.images,
+            components.frame_rate,
+            output_frame_rate,
+            width,
+            height,
+            start_frame,
+            frame_count,
+        )
+        audio = _slice_audio(components.audio, start_frame, end_frame, frame_rate)
+        output = InputImpl.VideoFromComponents(
+            Types.VideoComponents(images=images, audio=audio, frame_rate=output_frame_rate),
+            bit_depth=video.get_bit_depth(),
+        )
+        return io.NodeOutput(output)
 
 
 class VideoTimeline(io.ComfyNode):
@@ -260,6 +326,8 @@ class VideoTimeline(io.ComfyNode):
             for frame, frame_mask in keyframes.items():
                 if selection_start <= frame < selection_end:
                     mask[frame - window_start] = frame_mask.to(mask.device)
+            if window_end > frame_count and selection_end == frame_count:
+                mask[frame_count - window_start:] = mask[frame_count - window_start - 1]
         else:
             raise ValueError(f"Unknown video timeline mode: {mode}")
 
@@ -311,6 +379,7 @@ class VideoTimelineApply(io.ComfyNode):
     def execute(cls, video: Input.Video, edited_images, mask, start_frame, feather, frame_rate=0.0, composited=False) -> io.NodeOutput:
         components = video.get_components()
         images = components.images
+        output_frame_rate = Fraction(str(frame_rate)) if frame_rate > 0 else components.frame_rate
         frame_count = edited_images.shape[0]
         if mask.shape[0] != frame_count:
             raise ValueError("Edited images and timeline mask must have the same frame count")
@@ -347,7 +416,7 @@ class VideoTimelineApply(io.ComfyNode):
             source.mul_(1.0 - alpha).addcmul_(edited_images, alpha)
 
         output = InputImpl.VideoFromComponents(
-            Types.VideoComponents(images=result, audio=components.audio, frame_rate=Fraction(str(frame_rate)) if frame_rate > 0 else components.frame_rate),
+            Types.VideoComponents(images=result, audio=components.audio, frame_rate=output_frame_rate),
             bit_depth=video.get_bit_depth(),
         )
         return io.NodeOutput(output)
@@ -483,7 +552,7 @@ class VideoMaskEditor(io.ComfyNode):
 class VideoMaskEditorExtension(ComfyExtension):
     @override
     async def get_node_list(self):
-        return [VideoMaskEditor, VideoTimeline, VideoTimelineApply, VideoInpaintPreprocess, VideoInpaintPyramidBlend]
+        return [VideoMaskEditor, VideoProjectFormat, VideoTimeline, VideoTimelineApply, VideoInpaintPreprocess, VideoInpaintPyramidBlend]
 
 
 async def comfy_entrypoint():
