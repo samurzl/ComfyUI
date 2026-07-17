@@ -5,6 +5,15 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const roundFrame = (seconds) => Math.round(seconds * state.project.fps) / state.project.fps;
 const VIDEO_EXTENSIONS = new Set(["mp4", "webm", "mov", "mkv", "avi"]);
 const PROJECT_INDEX_FILE = "comfy-cut-projects.json";
+const LTX_DISTILLATION_PROFILES = {
+    distilled: { loraKey: "ltxDistilledLora", strength: .5 },
+    dmd: {
+        loraKey: "ltxDmdLora",
+        strength: 1,
+        firstPassSigmas: "1.000, 0.955, 0.893, 0.812, 0.715, 0.603, 0.482, 0.241, 0.121, 0.0",
+        upscaleSigmas: "0.92, 0.725, 0.421875, 0.0",
+    },
+};
 
 function emptyProject(width = 1920, height = 1080, fps = 30) {
     return {
@@ -25,7 +34,9 @@ function emptyProject(width = 1920, height = 1080, fps = 30) {
 const defaultSettings = {
     samCheckpoint: "sam3.1_multiplex_fp16.safetensors",
     ltxCheckpoint: "ltx-2.3-22b-dev-fp8.safetensors",
+    ltxDistillationMode: "distilled",
     ltxDistilledLora: "ltx-2.3-22b-distilled-lora-384.safetensors",
+    ltxDmdLora: "LTX2.3_DMD_reshaped_r256.safetensors",
     ltxInpaintLora: "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors",
     ltxTextEncoder: "gemma_3_12B_it_fp4_mixed.safetensors",
     ltxSpatialUpscaler: "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
@@ -87,6 +98,7 @@ function readSettings() {
 
 function normalizeSettings(settings) {
     settings.loraLibrary = Array.isArray(settings.loraLibrary) ? settings.loraLibrary : [];
+    if (!LTX_DISTILLATION_PROFILES[settings.ltxDistillationMode]) settings.ltxDistillationMode = "distilled";
     settings.projectMegapixels ||= (Number(settings.projectWidth) || 1920) * (Number(settings.projectHeight) || 1080) / 1_000_000;
     if (!settings.editAnythingLora && /edit_anything_v1\.1/i.test(settings.editAnythingStandardLora || "")) settings.editAnythingLora = settings.editAnythingStandardLora;
     delete settings.kreaCheckpoint;
@@ -1426,8 +1438,16 @@ function generationFormat() {
     return { width: state.project.width, height: state.project.height, fps: state.project.fps };
 }
 
+function ltxDistillation(settings = state.settings) {
+    const mode = LTX_DISTILLATION_PROFILES[settings.ltxDistillationMode] ? settings.ltxDistillationMode : "distilled";
+    const profile = LTX_DISTILLATION_PROFILES[mode];
+    return { mode, lora: settings[profile.loraKey], ...profile };
+}
+
 function ltxGenerationModels(kind) {
-    const models = { checkpoint: state.settings.ltxCheckpoint, distilledLora: state.settings.ltxDistilledLora, textEncoder: state.settings.ltxTextEncoder };
+    const distillation = ltxDistillation();
+    const models = { checkpoint: state.settings.ltxCheckpoint, distilledLora: distillation.lora, textEncoder: state.settings.ltxTextEncoder };
+    if (distillation.mode === "dmd") models.distillationMode = "dmd";
     if (kind === "i2v") models.spatialUpscaler = state.settings.ltxSpatialUpscaler;
     if (kind === "inpaint" || kind === "regenerate") models.inpaintLora = state.settings.ltxInpaintLora;
     if (kind === "edit-anything") models.editAnythingLora = state.settings.editAnythingLora;
@@ -1548,6 +1568,18 @@ function nodeTitleIncludes(text) {
     return (node) => (node._meta?.title || "").toLowerCase().includes(needle);
 }
 
+function applyLtxDistillation(prompt, loraPredicate) {
+    const distillation = ltxDistillation();
+    setNodeInput(prompt, loraPredicate, "lora_name", distillation.lora);
+    setNodeInput(prompt, loraPredicate, "strength_model", distillation.strength);
+    if (distillation.mode !== "dmd") return;
+    for (const node of Object.values(prompt)) {
+        if (node.class_type !== "ManualSigmas") continue;
+        const firstSigma = Number.parseFloat(node.inputs.sigmas);
+        node.inputs.sigmas = firstSigma >= .99 ? distillation.firstPassSigmas : distillation.upscaleSigmas;
+    }
+}
+
 function appendModelLoras(prompt, modelLink, loras, prefix = 9500) {
     let link = modelLink;
     let nodeId = prefix;
@@ -1614,7 +1646,6 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify({ mode: "inpaint", selection_start: startFrame, selection_end: endFrame, context_before: 2, context_after: 2, mask: maskData }));
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
-    setNodeInput(prompt, nodeTitleIncludes("distilled lora"), "lora_name", state.settings.ltxDistilledLora);
     setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
     setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "text_encoder", state.settings.ltxTextEncoder);
     setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "ckpt_name", state.settings.ltxCheckpoint);
@@ -1657,6 +1688,7 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     prompt["9015"] = { inputs: { generated: ["9014", 0], source: [sourceResizeId, 0], mask: [timelineId, 2], grow: 8, levels: 6 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Final inpaint boundary blend" } };
     prompt[timelineApplyId].inputs.edited_images = ["9015", 0];
     prompt[timelineApplyId].inputs.composited = true;
+    applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
     appendGenerationLoras(prompt, loras);
     return prompt;
 }
@@ -1678,7 +1710,6 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "timeline_data", JSON.stringify(timelineData));
     setNodeInput(prompt, (node) => node.class_type === "VideoTimeline", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "CheckpointLoaderSimple", "ckpt_name", state.settings.ltxCheckpoint);
-    setNodeInput(prompt, nodeTitleIncludes("distilled lora"), "lora_name", state.settings.ltxDistilledLora);
     setNodeInput(prompt, nodeTitleIncludes("in/outpainting"), "lora_name", state.settings.ltxInpaintLora);
     setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "text_encoder", state.settings.ltxTextEncoder);
     setNodeInput(prompt, (node) => node.class_type === "LTXAVTextEncoderLoader", "ckpt_name", state.settings.ltxCheckpoint);
@@ -1699,6 +1730,7 @@ async function buildTimelineRegenerationPrompt(videoReference, selectionStart, s
     } else {
         setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_regenerated_video");
     }
+    applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
     appendGenerationLoras(prompt, loras);
     return prompt;
 }
@@ -1728,6 +1760,7 @@ function buildEditAnythingPrompt(videoReference, clip, promptText, seed, loras =
         "18": { inputs: { images: ["17", 0], audio: ["2", 1], fps: state.project.fps }, class_type: "CreateVideo", _meta: { title: "Edited video with source audio" } },
         "19": { inputs: { video: ["18", 0], filename_prefix: "video/ComfyCut_EditAnything_v1_1", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Save EditAnything result" } },
     };
+    applyLtxDistillation(prompt, nodeTitleIncludes("distilled lora"));
     const model = appendModelLoras(prompt, ["6", 0], loras);
     prompt["15"].inputs.model = model;
     prompt["16"].inputs.model = model;
@@ -1741,7 +1774,8 @@ async function buildI2VPrompt(imageReference, clip, promptText, seed, loras = []
     const height = Math.max(64, Math.round(state.project.height / 32) * 32);
     const duration = Math.max(1, Math.ceil(clip.duration));
     const loadId = "9000";
-    const external = [[loadId, 0], promptText, width, height, duration, state.settings.ltxCheckpoint, state.settings.ltxDistilledLora, state.settings.ltxTextEncoder, state.settings.ltxSpatialUpscaler, Math.round(state.project.fps)];
+    const distillation = ltxDistillation();
+    const external = [[loadId, 0], promptText, width, height, duration, state.settings.ltxCheckpoint, distillation.lora, state.settings.ltxTextEncoder, state.settings.ltxSpatialUpscaler, Math.round(state.project.fps)];
     const { prompt, resolveLink } = graphToPrompt(graph, external);
     prompt[loadId] = { inputs: { image: annotatedResource(imageReference) }, class_type: "LoadImage", _meta: { title: "Comfy Cut start frame" } };
     const targetFrames = Math.ceil((Math.max(1, Math.round(clip.duration * state.project.fps)) - 1) / 8) * 8 + 1;
@@ -1750,6 +1784,7 @@ async function buildI2VPrompt(imageReference, clip, promptText, seed, loras = []
     setNodeInput(prompt, (node) => node.class_type === "RandomNoise", "noise_seed", seed);
     const outputLink = graph.outputs[0]?.linkIds?.[0];
     prompt["9001"] = { inputs: { video: resolveLink(outputLink), filename_prefix: "video/ComfyCut_i2v", format: "auto", codec: "auto" }, class_type: "SaveVideo", _meta: { title: "Comfy Cut output" } };
+    applyLtxDistillation(prompt, (node) => node.class_type === "LoraLoaderModelOnly" && node.inputs.lora_name === distillation.lora);
     appendGenerationLoras(prompt, loras);
     return prompt;
 }
@@ -3010,6 +3045,7 @@ async function openImageEdit() {
 }
 
 function workflowValues({ clip, prompt, seed, sourceImage, referenceImage }) {
+    const distillation = ltxDistillation();
     return {
         prompt,
         seed,
@@ -3022,6 +3058,9 @@ function workflowValues({ clip, prompt, seed, sourceImage, referenceImage }) {
         frame_count: Math.ceil((Math.round(clip.duration * state.project.fps) - 1) / 8) * 8 + 1,
         ltx_checkpoint: state.settings.ltxCheckpoint,
         ltx_distilled_lora: state.settings.ltxDistilledLora,
+        ltx_dmd_lora: state.settings.ltxDmdLora,
+        ltx_distillation_mode: distillation.mode,
+        ltx_distillation_lora: distillation.lora,
         ltx_inpaint_lora: state.settings.ltxInpaintLora,
         ltx_text_encoder: state.settings.ltxTextEncoder,
         ltx_spatial_upscaler: state.settings.ltxSpatialUpscaler,
@@ -3204,7 +3243,13 @@ function renderModelSettings(root, draft) {
     const fields = $(".settings-fields", root);
     modelInput(fields, draft, "SAM3 checkpoint", "samCheckpoint", "checkpoints");
     modelInput(fields, draft, "LTX 2.3 checkpoint", "ltxCheckpoint", "checkpoints");
-    modelInput(fields, draft, "LTX distilled LoRA", "ltxDistilledLora", "loras");
+    const distillationMode = document.createElement("select");
+    distillationMode.innerHTML = '<option value="distilled">Lightricks distilled</option><option value="dmd">DMD distilled</option>';
+    distillationMode.value = draft.ltxDistillationMode;
+    distillationMode.onchange = () => draft.ltxDistillationMode = distillationMode.value;
+    fields.append(field("LTX sampling profile", distillationMode, "DMD loads its LoRA at strength 1.0 and automatically uses its recommended first-pass and upscale schedules."));
+    modelInput(fields, draft, "Lightricks distilled LoRA", "ltxDistilledLora", "loras");
+    modelInput(fields, draft, "DMD distilled LoRA", "ltxDmdLora", "loras", "Use LTX2.3_DMD_reshaped_r256.safetensors.");
     modelInput(fields, draft, "In/Outpaint IC-LoRA", "ltxInpaintLora", "loras");
     modelInput(fields, draft, "LTX text encoder", "ltxTextEncoder", "text_encoders");
     modelInput(fields, draft, "LTX spatial upscaler", "ltxSpatialUpscaler", "latent_upscale_models");
