@@ -167,18 +167,13 @@ def _resize_mask(mask, height, width):
     return F.interpolate(mask.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False)[:, 0]
 
 
-def _prepare_timeline_images(images, source_frame_rate, output_frame_rate, width=0, height=0, start_frame=0, frame_count=None):
-    target_frame_count = images.shape[0]
+def _prepare_timeline_images(images, source_frame_rate, output_frame_rate, width=0, height=0):
     if source_frame_rate != output_frame_rate:
         source_rate = float(source_frame_rate)
         target_rate = float(output_frame_rate)
-        target_frame_count = max(1, round(images.shape[0] * target_rate / source_rate))
-        end_frame = target_frame_count if frame_count is None else min(target_frame_count, start_frame + frame_count)
-        indices = [min(images.shape[0] - 1, int(frame * source_rate / target_rate + 1e-6)) for frame in range(start_frame, end_frame)]
+        frame_count = max(1, round(images.shape[0] * target_rate / source_rate))
+        indices = [min(images.shape[0] - 1, int(frame * source_rate / target_rate + 1e-6)) for frame in range(frame_count)]
         images = images[indices]
-    else:
-        end_frame = target_frame_count if frame_count is None else min(target_frame_count, start_frame + frame_count)
-        images = images[start_frame:end_frame]
 
     source_height, source_width = images.shape[1:3]
     if width <= 0 and height > 0:
@@ -242,32 +237,17 @@ class VideoProjectFormat(io.ComfyNode):
                 io.Float.Input("frame_rate", default=24.0, min=1.0, max=240.0),
                 io.Int.Input("width", default=1920, min=1, max=16384),
                 io.Int.Input("height", default=1080, min=1, max=16384),
-                io.Float.Input("start_time", default=0.0, min=0.0, max=1e5),
-                io.Float.Input("duration", default=0.0, min=0.0, max=1e5),
             ],
             outputs=[io.Video.Output("video")],
         )
 
     @classmethod
-    def execute(cls, video: Input.Video, frame_rate, width, height, start_time=0.0, duration=0.0) -> io.NodeOutput:
+    def execute(cls, video: Input.Video, frame_rate, width, height) -> io.NodeOutput:
         components = video.get_components()
         output_frame_rate = Fraction(str(frame_rate))
-        converted_frame_count = max(1, round(components.images.shape[0] * float(output_frame_rate) / float(components.frame_rate)))
-        start_frame = min(converted_frame_count - 1, max(0, round(start_time * frame_rate)))
-        frame_count = converted_frame_count - start_frame if duration <= 0 else min(converted_frame_count - start_frame, max(1, round(duration * frame_rate)))
-        end_frame = start_frame + frame_count
-        images = _prepare_timeline_images(
-            components.images,
-            components.frame_rate,
-            output_frame_rate,
-            width,
-            height,
-            start_frame,
-            frame_count,
-        )
-        audio = _slice_audio(components.audio, start_frame, end_frame, frame_rate)
+        images = _prepare_timeline_images(components.images, components.frame_rate, output_frame_rate, width, height)
         output = InputImpl.VideoFromComponents(
-            Types.VideoComponents(images=images, audio=audio, frame_rate=output_frame_rate),
+            Types.VideoComponents(images=images, audio=components.audio, frame_rate=output_frame_rate),
             bit_depth=video.get_bit_depth(),
         )
         return io.NodeOutput(output)

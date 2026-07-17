@@ -1684,7 +1684,8 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     const vaeTileSize = ltxVaeTileSize();
     const vaeTileOverlap = Math.min(64, Math.floor(vaeTileSize / 4));
 
-    prompt["8998"] = { inputs: { video: [loadId, 0], frame_rate: fps, width: state.project.width, height: state.project.height, start_time: clip.sourceIn, duration: clip.duration }, class_type: "VideoProjectFormat", _meta: { title: "Project-format source clip" } };
+    prompt["8997"] = { inputs: { video: [loadId, 0], start_time: clip.sourceIn, duration: clip.duration, strict_duration: false }, class_type: "Video Slice", _meta: { title: "Trim source before decoding" } };
+    prompt["8998"] = { inputs: { video: ["8997", 0], frame_rate: fps, width: state.project.width, height: state.project.height }, class_type: "VideoProjectFormat", _meta: { title: "Project-format source clip" } };
     prompt[timelineId].inputs.video = ["8998", 0];
     prompt[timelineApplyId].inputs.video = ["8998", 0];
     prompt[sourceResizeId].inputs = { input: [timelineId, 0], resize_type: "scale to multiple", "resize_type.multiple": 32, scale_method: "area" };
@@ -2899,7 +2900,7 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint-backend-resampled-v8", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-trim-before-resample-v9", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);

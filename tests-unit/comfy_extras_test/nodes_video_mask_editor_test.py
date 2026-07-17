@@ -48,10 +48,10 @@ def test_project_format_outputs_one_shared_frame_sequence():
     images = torch.arange(30, dtype=torch.float32).reshape(30, 1, 1, 1).expand(-1, 2, 2, 3)
     video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(30)))
 
-    output = VideoProjectFormat.execute(video, frame_rate=24, width=2, height=2, start_time=10 / 24, duration=5 / 24).result[0].get_components()
+    output = VideoProjectFormat.execute(video, frame_rate=24, width=2, height=2).result[0].get_components()
 
     assert output.frame_rate == 24
-    assert output.images[:, 0, 0, 0].tolist() == [12, 13, 15, 16, 17]
+    assert output.images[:, 0, 0, 0].tolist() == [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 25, 26, 27, 28]
 
 
 def _mask(x, y):
