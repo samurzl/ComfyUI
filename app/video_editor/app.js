@@ -977,20 +977,28 @@ function activeClips(kind, time = state.playhead) {
 
 function syncRuntime() {
     const activeIds = new Set();
-    for (const kind of ["video", "audio"]) {
+    for (const kind of ["audio", "video"]) {
         for (const { clip } of activeClips(kind)) {
             const element = runtimeElement(clip, kind);
             if (!element) continue;
             activeIds.add(clip.id);
             const sourceTime = clip.sourceIn + state.playhead - clip.start;
-            if (Math.abs(element.currentTime - sourceTime) > (state.playing ? 0.18 : 0.025)) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration || clip.sourceDuration));
-            if (kind === "audio") element.muted = false;
+            const drift = sourceTime - element.currentTime;
+            const tolerance = kind === "audio" ? (state.playing ? 0.045 : 0.015) : (state.playing ? 0.18 : 0.025);
+            if (Math.abs(drift) > tolerance) element.currentTime = clamp(sourceTime, 0, Math.max(0, element.duration || clip.sourceDuration));
+            if (kind === "audio") {
+                element.muted = false;
+                element.playbackRate = state.playing && Math.abs(drift) <= tolerance ? clamp(1 + drift * .5, .97, 1.03) : 1;
+            }
             if (state.playing && element.paused) element.play().catch(() => {});
             if (!state.playing && !element.paused) element.pause();
         }
     }
     for (const [id, element] of state.runtime) {
-        if (!activeIds.has(id) && !element.paused) element.pause();
+        if (!activeIds.has(id)) {
+            if (!element.paused) element.pause();
+            element.playbackRate = 1;
+        }
     }
 }
 
@@ -1593,6 +1601,7 @@ function requireNodes(types, feature) {
 }
 
 async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) {
+    requireNodes(["VideoInpaintPreprocess", "VideoInpaintPyramidBlend"], "Two-stage LTX inpaint");
     const data = await blueprint("Video Timeline Edit (LTX-2.3).json");
     const graph = data.definitions.subgraphs[0];
     const { prompt } = graphToPrompt(graph);
@@ -1615,6 +1624,39 @@ async function buildInpaintPrompt(clip, promptText, seed, maskData, loras = []) 
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "feather", 8);
     setNodeInput(prompt, (node) => node.class_type === "VideoTimelineApply", "frame_rate", fps);
     setNodeInput(prompt, (node) => node.class_type === "SaveVideo", "filename_prefix", "video/ComfyCut_inpaint");
+
+    const timelineId = promptNodeId(prompt, (node) => node.class_type === "VideoTimeline");
+    const sourceResizeId = promptNodeId(prompt, nodeTitleIncludes("prepare ltx guide"));
+    const sizeId = promptNodeId(prompt, (node) => node.class_type === "GetImageSize");
+    const guideId = promptNodeId(prompt, (node) => node.class_type === "LTXVAddGuide");
+    const checkpointId = promptNodeId(prompt, (node) => node.class_type === "CheckpointLoaderSimple");
+    const modelId = promptNodeId(prompt, nodeTitleIncludes("in/outpainting"));
+    const stageOneSeparateId = promptNodeId(prompt, (node) => node.class_type === "LTXVSeparateAVLatent");
+    const cropId = promptNodeId(prompt, (node) => node.class_type === "LTXVCropGuides");
+    const stageOneDecodeId = promptNodeId(prompt, (node) => node.class_type === "VAEDecodeTiled");
+    const timelineApplyId = promptNodeId(prompt, (node) => node.class_type === "VideoTimelineApply");
+
+    prompt[sourceResizeId].inputs = { input: [timelineId, 0], resize_type: "scale to multiple", "resize_type.multiple": 64, scale_method: "area" };
+    prompt["9000"] = { inputs: { input: [sourceResizeId, 0], resize_type: "scale by multiplier", "resize_type.multiplier": .5, scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 half-resolution source" } };
+    prompt["9001"] = { inputs: { input: [timelineId, 2], resize_type: "match size", "resize_type.match": ["9000", 0], "resize_type.crop": "disabled", scale_method: "area" }, class_type: "ResizeImageMaskNode", _meta: { title: "Stage 1 mask" } };
+    prompt["9002"] = { inputs: { mask: ["9001", 0], expand: 15, tapered_corners: true }, class_type: "GrowMask", _meta: { title: "Dilate stage 1 mask" } };
+    prompt["9003"] = { inputs: { images: ["9000", 0], mask: ["9002", 0] }, class_type: "VideoInpaintPreprocess", _meta: { title: "Stage 1 masked guide" } };
+    prompt[sizeId].inputs.image = ["9003", 0];
+    prompt[guideId].inputs.image = ["9003", 0];
+    prompt["9004"] = { inputs: { generated: [stageOneDecodeId, 0], source: ["9000", 0], mask: ["9002", 0], grow: 0, levels: 5 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Stage 1 boundary blend" } };
+    prompt["9005"] = { inputs: { input: ["9004", 0], resize_type: "scale by multiplier", "resize_type.multiplier": 2, scale_method: "lanczos" }, class_type: "ResizeImageMaskNode", _meta: { title: "Upscale for stage 2" } };
+    prompt["9006"] = { inputs: { pixels: ["9005", 0], vae: [checkpointId, 2], tile_size: 512, overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEEncodeTiled", _meta: { title: "Encode stage 2 latent" } };
+    prompt["9007"] = { inputs: { video_latent: ["9006", 0], audio_latent: [stageOneSeparateId, 1] }, class_type: "LTXVConcatAVLatent", _meta: { title: "Stage 2 AV latent" } };
+    prompt["9008"] = { inputs: { noise_seed: seed }, class_type: "RandomNoise", _meta: { title: "Stage 2 noise" } };
+    prompt["9009"] = { inputs: { sampler_name: "euler_ancestral_cfg_pp" }, class_type: "KSamplerSelect", _meta: { title: "Stage 2 sampler" } };
+    prompt["9010"] = { inputs: { sigmas: "0.725, 0.421875, 0.0" }, class_type: "ManualSigmas", _meta: { title: "Stage 2 refinement schedule" } };
+    prompt["9011"] = { inputs: { model: [modelId, 0], positive: [cropId, 0], negative: [cropId, 1], cfg: 1 }, class_type: "CFGGuider", _meta: { title: "Stage 2 guider" } };
+    prompt["9012"] = { inputs: { noise: ["9008", 0], guider: ["9011", 0], sampler: ["9009", 0], sigmas: ["9010", 0], latent_image: ["9007", 0] }, class_type: "SamplerCustomAdvanced", _meta: { title: "Stage 2 refinement" } };
+    prompt["9013"] = { inputs: { av_latent: ["9012", 0] }, class_type: "LTXVSeparateAVLatent", _meta: { title: "Stage 2 video latent" } };
+    prompt["9014"] = { inputs: { samples: ["9013", 0], vae: [checkpointId, 2], tile_size: 768, overlap: 64, temporal_size: 4096, temporal_overlap: 4 }, class_type: "VAEDecodeTiled", _meta: { title: "Decode refined video" } };
+    prompt["9015"] = { inputs: { generated: ["9014", 0], source: [sourceResizeId, 0], mask: [timelineId, 2], grow: 8, levels: 6 }, class_type: "VideoInpaintPyramidBlend", _meta: { title: "Final inpaint boundary blend" } };
+    prompt[timelineApplyId].inputs.edited_images = ["9015", 0];
+    prompt[timelineApplyId].inputs.composited = true;
     appendGenerationLoras(prompt, loras);
     return prompt;
 }
@@ -1813,7 +1855,16 @@ function openModal(title, subtitle, className = "") {
     return { root: backdrop, body: $(".modal-body", backdrop), footer: $(".modal-footer", backdrop) };
 }
 
+function stopMedia(root) {
+    for (const media of root?.querySelectorAll?.("video, audio") || []) {
+        media.pause();
+        media.removeAttribute("src");
+        media.load();
+    }
+}
+
 function closeModal() {
+    stopMedia(state.activeModal);
     state.activeModal?.remove();
     state.activeModal = null;
 }
@@ -2628,9 +2679,9 @@ async function bakeClip(clip, onProgress = () => {}, includeTransform = true, pa
     const transform = includeTransform ? clip.transform || defaultTransform() : defaultTransform();
     const targetFrames = Math.ceil((Math.max(1, Math.round(clip.duration * state.project.fps)) - 1) / 8) * 8 + 1;
     const bakedDuration = padToLtx ? targetFrames / state.project.fps : clip.duration;
+    await video.play();
     const started = performance.now();
     recorder.start(500);
-    await video.play();
     await new Promise((resolve) => {
         const draw = () => {
             const elapsed = (performance.now() - started) / 1000;
@@ -2764,7 +2815,7 @@ async function openInpaint() {
             const useTransform = $(".use-transform", modal.body).checked;
             const seed = Number($(".seed", modal.body).value);
             const loras = selectedLoras();
-            const key = await generationKey("inpaint-pad-and-trim-v2", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
+            const key = await generationKey("inpaint-two-stage-v4", { source: generationSource(sourceClip, useTransform), mask: sourceClip.mask, useTransform, promptText, seed, format: generationFormat(), models: ltxGenerationModels("inpaint"), loras });
             output = cachedGeneration(sourceClip, key);
             if (output) {
                 showJobVideo(preview, resourceUrl(output), generatedSourceIn, sourceClip.duration);
@@ -2812,6 +2863,7 @@ function randomSeed() {
 function showJobImage(preview, url) {
     let image = $("img", preview);
     if (!image) {
+        stopMedia(preview);
         preview.innerHTML = "";
         image = document.createElement("img");
         preview.append(image);
@@ -2820,6 +2872,7 @@ function showJobImage(preview, url) {
 }
 
 function showJobVideo(preview, url, start = 0, duration = null, muted = false) {
+    stopMedia(preview);
     preview.innerHTML = `<video src="${escapeHtml(url)}" controls autoplay playsinline ${muted ? "muted" : ""}></video>`;
     const video = $("video", preview);
     video.onloadedmetadata = () => {

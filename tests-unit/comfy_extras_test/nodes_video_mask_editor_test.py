@@ -7,6 +7,8 @@ from PIL import Image
 
 from comfy_api.latest import InputImpl, Types
 from comfy_extras.nodes_video_mask_editor import (
+    VideoInpaintPreprocess,
+    VideoInpaintPyramidBlend,
     VideoTimeline,
     VideoTimelineApply,
     _load_keyframes,
@@ -144,3 +146,54 @@ def test_apply_timeline_edit_trims_ltx_padding_and_sets_frame_rate():
     assert components.images.shape[0] == 100
     assert components.images.all()
     assert components.frame_rate == 24
+
+
+def test_apply_timeline_feathers_outside_the_mask():
+    images = torch.zeros(1, 32, 32, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(24)))
+    edited = torch.ones(1, 32, 32, 3)
+    mask = torch.zeros(1, 32, 32)
+    mask[:, 10:20, 10:20] = 1
+
+    output = VideoTimelineApply.execute(video, edited, mask, start_frame=0, feather=2).result[0]
+    result = output.get_components().images
+
+    assert result[:, 10:20, 10:20].min() == 1
+    assert result[:, 7, 15].max() > 0
+    assert result[:, 0, 0].max() == 0
+
+
+def test_apply_timeline_accepts_an_already_composited_window():
+    images = torch.zeros(2, 8, 8, 3)
+    video = InputImpl.VideoFromComponents(Types.VideoComponents(images=images, audio=None, frame_rate=Fraction(24)))
+    edited = torch.ones(1, 8, 8, 3)
+    mask = torch.zeros(1, 8, 8)
+
+    output = VideoTimelineApply.execute(video, edited, mask, start_frame=1, feather=0, composited=True).result[0]
+    result = output.get_components().images
+
+    assert not result[0].any()
+    assert result[1].all()
+
+
+def test_inpaint_preprocess_uses_green_only_inside_mask():
+    images = torch.zeros(1, 8, 8, 3)
+    mask = torch.zeros(1, 8, 8)
+    mask[:, 2:6, 2:6] = 1
+
+    output = VideoInpaintPreprocess.execute(images, mask).result[0]
+
+    assert torch.equal(output[:, 2:6, 2:6], torch.tensor([0.4, 1.0, 0.0]).expand(1, 4, 4, 3))
+    assert not output[:, :2].any()
+
+
+def test_inpaint_pyramid_blend_preserves_distant_source_pixels():
+    generated = torch.ones(1, 32, 32, 3)
+    source = torch.zeros(1, 32, 32, 3)
+    mask = torch.zeros(1, 32, 32)
+    mask[:, 12:20, 12:20] = 1
+
+    output = VideoInpaintPyramidBlend.execute(generated, source, mask, grow=0, levels=3).result[0]
+
+    assert output[:, 14:18, 14:18].mean() > 0.8
+    assert output[:, 0, 0].max() < 0.01
